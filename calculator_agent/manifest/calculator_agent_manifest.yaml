@@ -1,0 +1,169 @@
+# =============================================================================
+# calculator_agent_manifest.yaml — Calculator Agent Manifest
+# Version schema: v1.0
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# IDENTITY
+# Who is this agent, what does it do, who owns it
+# -----------------------------------------------------------------------------
+identity:
+  agent_id: "calculator_agent_001"
+  name: "calculator_agent"
+  display_name: "Calculator Agent"
+  description: >
+    Solves math problems step by step. Handles basic arithmetic
+    and algebra. Escalates complex problems like calculus to human review.
+  owner:
+    team: "quantum-team"
+    email: "quantum@company.com"
+  version: "1.0.0"
+  status: "draft"              # draft | active | deprecated 
+
+
+  # -----------------------------------------------------------------------------
+# MODEL
+# Which model to use and how it should behave
+# -----------------------------------------------------------------------------
+model:
+  base_model_id: "gemini-2.5-flash"
+  base_model_source: "google_ai_studio"   # google_ai_studio | vertex_ai
+  inference:
+    temperature: 0.1                      # low = more deterministic, good for math
+    max_output_tokens: 1024
+    top_p: 0.9   #controls how model picks the next word.
+
+
+# -----------------------------------------------------------------------------
+# CAPABILITIES
+# What tools the agent is permitted to use.
+# Any tool not declared here should be denied.
+# -----------------------------------------------------------------------------
+capabilities:
+  modalities:
+    input: ["text"]
+    output: ["text"]
+
+  tools:
+    - tool_id: "add"
+      display_name: "Addition Tool"
+      description: "Adds two numbers together."
+      type: "function"
+      allowed: true
+
+    - tool_id: "subtract"
+      display_name: "Subtraction Tool"
+      description: "Subtracts b from a."
+      type: "function"
+      allowed: true
+
+    - tool_id: "multiply"
+      display_name: "Multiplication Tool"
+      description: "Multiplies two numbers."
+      type: "function"
+      allowed: true
+
+    - tool_id: "divide"
+      display_name: "Division Tool"
+      description: "Divides a by b. Handles divide by zero."
+      type: "function"
+      allowed: true
+
+    - tool_id: "escalate"
+      display_name: "Escalation Tool"
+      description: "Routes complex problems to human review."
+      type: "human_in_loop"
+      allowed: true
+
+# -----------------------------------------------------------------------------
+# POLICY
+# Rules the agent must follow at every step.
+# Control plane enforces these — agent code should not hardcode any of this.
+# -----------------------------------------------------------------------------
+policy:
+  confidence_threshold: 0.7         # escalate if agent confidence drops below this
+
+  allowed_problem_types:
+    - "arithmetic"
+    - "algebra"
+    - "word_problems"
+
+  denied_problem_types:
+    - "calculus"
+    - "differential_equations"
+    - "abstract_algebra"
+
+  escalation:
+    enabled: true
+    trigger_on_low_confidence: true
+    trigger_on_denied_problem_type: true
+    escalation_message: "Problem is too complex or confidence is too low. Routing to human review."
+
+  rate_limits:
+    requests_per_minute: 30
+    max_concurrent_sessions: 5
+
+  allowed_callers:
+    - "any"                          # open for now, lock down in production
+
+
+
+# -----------------------------------------------------------------------------
+# OBSERVABILITY
+# How we monitor, log and track the agent's behavior.
+# -----------------------------------------------------------------------------
+observability:
+  logging:
+    enabled: true
+    log_level: "INFO"               # DEBUG | INFO | WARN | ERROR
+    log_tool_calls: true            # log every time a tool is called
+    log_escalations: true           # always log when escalation happens
+    redact_pii: false               # no PII in calculator, so false
+
+  metrics:
+    enabled: true
+    track:
+      - name: "tool_call_count"
+        description: "How many times each tool was called"
+      - name: "escalation_rate"
+        description: "Fraction of problems escalated to human"
+      - name: "confidence_score"
+        description: "Distribution of confidence scores per request"
+      - name: "response_latency_ms"
+        description: "End to end response time in milliseconds"
+
+  alerts:
+    - name: "high_escalation_rate"
+      metric: "escalation_rate"
+      threshold: 0.3                # alert if more than 30% problems are escalated
+      message: "Too many problems being escalated — model may need retraining"
+
+
+# -----------------------------------------------------------------------------
+# DEPLOYMENT
+# Where and how the agent gets deployed.
+# Canary strategy ensures safe rollouts.
+# -----------------------------------------------------------------------------
+deployment:
+  targets:
+    - environment: "local"
+      runtime: "adk_web"            # running locally via adk web for now
+
+    - environment: "staging"
+      runtime: "cloud_run"
+      region: "us-central1"
+
+    - environment: "production"
+      runtime: "cloud_run"
+      region: "us-central1"
+
+  canary:
+    enabled: false                  # off for local dev, enable in production
+    initial_traffic_pct: 10         # start with 10% traffic on new version
+    increment_pct: 20               # 10 → 30 → 50 → 70 → 100
+    rollback_on_failure: true       # auto rollback if something breaks
+
+  lifecycle:
+    max_turns: 20                   # max back and forth turns per session
+    session_timeout_seconds: 300    # kill session after 5 mins of inactivity
+    graceful_shutdown_seconds: 30   # give agent 30s to finish before killing

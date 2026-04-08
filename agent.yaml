@@ -1,0 +1,428 @@
+# =============================================================================
+# agent.yaml — Agentic AI Platform | Agent Manifest
+# Version schema: v1.2
+# Spec: https://internal.platform/docs/agent-manifest-schema/v1.2
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# IDENTITY
+# Immutable once registered. Version bump required for any change.
+# -----------------------------------------------------------------------------
+identity:
+  agent_id: ""                          # Auto-assigned by registry on first publish (UUID v4)
+  name: "fraud-detection-agent"         # Kebab-case, globally unique within domain
+  display_name: "Fraud Detection Agent"
+  domain: "risk"                        # risk | finance | ops | customer | infra | internal
+  description: >
+    Analyses transaction streams and customer behaviour signals to detect
+    fraudulent activity in real time. Escalates high-confidence cases to
+    the fraud ops queue and annotates low-confidence cases for human review.
+  owner:
+    team: "risk-platform"
+    email: "risk-platform@company.com"
+    oncall_runbook: "https://internal.platform/runbooks/fraud-detection-agent"
+  tags:
+    - fraud
+    - real-time
+    - finops
+    - pii-handler
+  semver: "1.0.0"                       # Semantic version — MAJOR.MINOR.PATCH
+  status: "draft"                       # draft | validated | registered | active | deprecated
+  created_at: ""                        # Auto-set by registry (ISO 8601)
+  updated_at: ""                        # Auto-set on every registry write
+
+# -----------------------------------------------------------------------------
+# MODEL
+# Base model + optional PEFT adapter. Adapter weights live in GCS.
+# -----------------------------------------------------------------------------
+model:
+  base_model_id: "gemini-2.0-flash-001"
+  base_model_source: "vertex_ai"        # vertex_ai | artifact_registry | huggingface
+  adapter:
+    enabled: true
+    type: "lora"                        # lora | qlora | prefix_tuning | full_ft | none
+    adapter_uri: "gs://ml-artifacts/adapters/fraud-detection/v1.0.0/adapter_weights.bin"
+    adapter_hash: "sha256:abc123..."    # SHA-256 of adapter weights — verified at load time
+    base_model_version_pinned: true     # If true, registry rejects promotion if base model changes
+  inference:
+    max_input_tokens: 8192
+    max_output_tokens: 1024
+    temperature: 0.1                    # Low — deterministic risk scoring preferred
+    top_p: 0.9
+    top_k: 40
+    stop_sequences: ["</output>", "END"]
+    response_mime_type: "application/json"
+
+# -----------------------------------------------------------------------------
+# RUNTIME
+# Container image, resource requirements, and lifecycle config.
+# -----------------------------------------------------------------------------
+runtime:
+  image:
+    uri: ""                             # Auto-populated by Build stage (Artifact Registry digest)
+    digest: ""                          # sha256 digest — immutable ref, set post-build
+    base_image: "us-docker.pkg.dev/platform/base/agent-runtime:3.1.0"
+    build_config: "cloudbuild.yaml"     # Path relative to repo root
+  resources:
+    accelerator: "NVIDIA_A100_80GB"     # NVIDIA_A100_80GB | NVIDIA_H100_80GB | none
+    accelerator_count: 1
+    cpu_request: "4"
+    cpu_limit: "8"
+    memory_request: "16Gi"
+    memory_limit: "32Gi"
+    gpu_memory_fraction: 0.9
+  scaling:
+    min_replicas: 1
+    max_replicas: 10
+    scale_to_zero: false                # false for latency-sensitive; true for batch-only agents
+    scale_up_cooldown_seconds: 60
+    scale_down_cooldown_seconds: 300
+    target_requests_per_replica: 5
+  lifecycle:
+    max_turns: 20                       # Maximum agentic loop iterations per session
+    session_timeout_seconds: 300
+    idle_timeout_seconds: 60
+    graceful_shutdown_seconds: 30
+    startup_probe_path: "/healthz/ready"
+    liveness_probe_path: "/healthz/live"
+
+# -----------------------------------------------------------------------------
+# CAPABILITIES
+# Declared tools and external integrations the agent is permitted to invoke.
+# Tool scopes are enforced at runtime by the Tool Execution sandbox.
+# Any tool invocation not declared here is denied automatically.
+# -----------------------------------------------------------------------------
+capabilities:
+  modalities:
+    input: ["text", "structured_data"]
+    output: ["text", "structured_data", "action"]
+
+  tools:
+    - tool_id: "bigquery-transaction-reader"
+      display_name: "BigQuery Transaction Reader"
+      description: "Read-only access to the transactions table for a given account ID and time window."
+      type: "data_source"               # data_source | api_call | sub_agent | human_in_loop | code_exec
+      endpoint: "gs://tool-configs/bigquery-transaction-reader/v2.json"
+      scopes:
+        - "bigquery.jobs.create"
+        - "bigquery.tables.getData"
+      allowed_datasets:
+        - "prod-data.transactions"
+        - "prod-data.accounts"
+      read_only: true
+      timeout_seconds: 10
+      retry:
+        max_attempts: 3
+        backoff_multiplier: 1.5
+
+    - tool_id: "risk-score-api"
+      display_name: "Risk Scoring API"
+      description: "Calls the internal ML risk scoring microservice and returns a composite risk vector."
+      type: "api_call"
+      endpoint: "https://risk-api.internal/v2/score"
+      auth:
+        type: "service_account"         # service_account | oauth2 | api_key | mtls
+        sa_email: "fraud-agent-sa@project.iam.gserviceaccount.com"
+      scopes:
+        - "risk.score.read"
+      timeout_seconds: 5
+      retry:
+        max_attempts: 2
+        backoff_multiplier: 2.0
+      circuit_breaker:
+        failure_threshold: 5
+        recovery_timeout_seconds: 30
+
+    - tool_id: "fraud-ops-queue-writer"
+      display_name: "Fraud Ops Queue Writer"
+      description: "Publishes a structured escalation record to the fraud-ops Pub/Sub topic."
+      type: "api_call"
+      endpoint: "pubsub://projects/prod-project/topics/fraud-ops-escalations"
+      auth:
+        type: "service_account"
+        sa_email: "fraud-agent-sa@project.iam.gserviceaccount.com"
+      scopes:
+        - "pubsub.topics.publish"
+      allowed_topics:
+        - "fraud-ops-escalations"
+      timeout_seconds: 5
+      retry:
+        max_attempts: 3
+        backoff_multiplier: 1.0
+
+    - tool_id: "human-review-handoff"
+      display_name: "Human Review Handoff"
+      description: "Flags a case for asynchronous human review when agent confidence is below threshold."
+      type: "human_in_loop"
+      endpoint: "https://review-platform.internal/api/v1/cases"
+      auth:
+        type: "service_account"
+        sa_email: "fraud-agent-sa@project.iam.gserviceaccount.com"
+      scopes:
+        - "review.cases.create"
+      confidence_threshold: 0.75        # Agent must route below this confidence to human
+      timeout_seconds: 3
+
+    - tool_id: "code-sandbox"
+      display_name: "Python Code Sandbox"
+      description: "Executes sandboxed Python for statistical analysis on transaction features."
+      type: "code_exec"
+      runtime: "python3.11"
+      sandbox: "gvisor"                 # gvisor | firecracker | docker (gvisor preferred)
+      allowed_packages:
+        - "numpy==1.26.4"
+        - "scipy==1.13.0"
+        - "pandas==2.2.2"
+      network_access: false             # No outbound network from sandbox
+      max_execution_seconds: 15
+      max_output_bytes: 65536
+
+# -----------------------------------------------------------------------------
+# MEMORY
+# Three-tier memory architecture. Each tier has independent TTL and access rules.
+# -----------------------------------------------------------------------------
+memory:
+  in_context:
+    enabled: true
+    max_tokens: 8192
+    strategy: "sliding_window"          # sliding_window | summarise_and_truncate | full
+    system_prompt_uri: "gs://agent-configs/fraud-detection/prompts/system_v1.txt"
+    few_shot_examples_uri: "gs://agent-configs/fraud-detection/prompts/few_shot_v1.jsonl"
+
+  vector_store:
+    enabled: true
+    backend: "vertex_matching_engine"   # vertex_matching_engine | weaviate | pinecone
+    index_endpoint: "projects/prod-project/locations/us-central1/indexEndpoints/fraud-kb-endpoint"
+    index_id: "fraud-knowledge-base-v3"
+    embedding_model: "text-embedding-004"
+    top_k: 10
+    similarity_threshold: 0.82
+    namespace: "fraud-patterns"
+    ttl_days: 90
+
+  long_term_store:
+    enabled: true
+    backend: "firestore"                # firestore | spanner | cloudsql
+    collection: "agent-sessions/fraud-detection"
+    retention_days: 365
+    pii_fields_encrypted: true          # Cloud KMS envelope encryption on PII fields
+    kms_key_uri: "projects/prod-project/locations/us-central1/keyRings/agent-keyring/cryptoKeys/agent-data-key"
+
+# -----------------------------------------------------------------------------
+# ORCHESTRATION
+# How this agent participates in multi-agent workflows.
+# -----------------------------------------------------------------------------
+orchestration:
+  role: "specialist"                    # orchestrator | specialist | peer
+  parent_agent_ids: []                  # Orchestrator agent IDs that may invoke this agent
+  sub_agent_ids: []                     # Specialist agents this agent may delegate to
+  communication:
+    protocol: "a2a"                     # a2a (Agent-to-Agent) | mcp | direct_api
+    auth: "workload_identity"           # workload_identity | jwt | mtls
+  delegation:
+    max_delegation_depth: 2             # Prevent runaway recursive delegation
+    allowed_delegatee_domains:
+      - "risk"
+      - "ops"
+
+# -----------------------------------------------------------------------------
+# POLICY
+# OPA bundle reference and inline guardrails evaluated at every turn.
+# DLP profile governs what data the agent may surface in outputs.
+# -----------------------------------------------------------------------------
+policy:
+  risk_tier: "high"                     # low | medium | high
+  opa_bundle:
+    gcs_uri: "gs://opa-bundles/fraud-detection-agent/v1.0.0/bundle.tar.gz"
+    bundle_hash: "sha256:def456..."
+    eval_entrypoint: "data.agents.fraud.allow"
+    eval_on: ["tool_call", "output"]    # Evaluation triggers
+  dlp:
+    profile_id: "projects/prod-project/locations/global/inspectTemplates/pii-strict"
+    action:
+      on_detect: "redact"               # redact | tokenise | block | flag
+      pii_types:
+        - "CREDIT_CARD_NUMBER"
+        - "IBAN_CODE"
+        - "PHONE_NUMBER"
+        - "EMAIL_ADDRESS"
+        - "PERSON_NAME"
+        - "US_SOCIAL_SECURITY_NUMBER"
+    scan_inputs: true
+    scan_outputs: true
+  data_residency:
+    regions: ["us-central1", "us-east1"]
+    cross_region_allowed: false
+  allowed_callers:
+    - "orchestrator-agent@project.iam.gserviceaccount.com"
+    - "api-gateway-sa@project.iam.gserviceaccount.com"
+  denied_callers: []
+  rate_limits:
+    requests_per_minute: 300
+    tokens_per_minute: 500000
+    concurrent_sessions: 50
+
+# -----------------------------------------------------------------------------
+# OBSERVABILITY
+# Telemetry configuration — all signals routed via OpenTelemetry collector.
+# -----------------------------------------------------------------------------
+observability:
+  tracing:
+    enabled: true
+    exporter: "cloud_trace"
+    sample_rate: 0.25                   # 25% sampling in production; 1.0 in staging
+    propagator: "w3c_trace_context"
+    span_attributes:
+      - "agent.id"
+      - "agent.version"
+      - "session.id"
+      - "tool.id"
+      - "turn.index"
+  metrics:
+    enabled: true
+    exporter: "cloud_monitoring"
+    custom_metrics:
+      - name: "agent/ttft_ms"
+        type: "histogram"
+        description: "Time to first token (ms)"
+        unit: "ms"
+        slo_threshold_p99: 800
+      - name: "agent/tool_call_success_rate"
+        type: "gauge"
+        description: "Fraction of tool calls that succeed"
+        slo_threshold: 0.99
+      - name: "agent/turn_latency_ms"
+        type: "histogram"
+        description: "End-to-end turn latency (ms)"
+        unit: "ms"
+        slo_threshold_p99: 3000
+      - name: "agent/confidence_score"
+        type: "histogram"
+        description: "Agent output confidence distribution"
+      - name: "agent/escalation_rate"
+        type: "gauge"
+        description: "Fraction of sessions escalated to human review"
+  logging:
+    enabled: true
+    exporter: "cloud_logging"
+    log_level: "INFO"                   # DEBUG | INFO | WARN | ERROR
+    structured: true
+    redact_pii_in_logs: true
+    log_tool_inputs: false              # Disable in production to avoid PII leakage
+    log_tool_outputs: false
+    log_model_inputs: false
+    log_model_outputs: false
+  monitoring:
+    drift_detection:
+      enabled: true
+      baseline_dataset: "gs://monitoring-baselines/fraud-detection/v1.0.0/eval_set.jsonl"
+      alert_threshold: 0.15             # Jensen-Shannon divergence threshold
+      check_interval_hours: 6
+    alerting:
+      notification_channels:
+        - "projects/prod-project/notificationChannels/fraud-platform-pagerduty"
+        - "projects/prod-project/notificationChannels/fraud-platform-slack"
+
+# -----------------------------------------------------------------------------
+# EVAL
+# Evaluation harness configuration — run by Stage 4 of the publish pipeline.
+# All thresholds are gates: failure blocks registration.
+# -----------------------------------------------------------------------------
+eval:
+  dataset_uri: "gs://eval-datasets/fraud-detection/v1.0.0/test_set.jsonl"
+  harness: "vertex_experiments"
+  metrics:
+    accuracy:
+      threshold: 0.92
+      higher_is_better: true
+    f1_score:
+      threshold: 0.90
+      higher_is_better: true
+    false_positive_rate:
+      threshold: 0.05
+      higher_is_better: false
+    tool_call_success_rate:
+      threshold: 0.99
+      higher_is_better: true
+    p99_latency_ms:
+      threshold: 3000
+      higher_is_better: false
+    safety_pass:
+      threshold: 1.0                    # Must be 1.0 — any safety failure blocks registration
+      higher_is_better: true
+  red_team:
+    enabled: true
+    test_suite_uri: "gs://red-team-suites/standard/v2.1/fraud-domain.jsonl"
+    fail_on_any_breach: true
+  regression_guard:
+    enabled: true
+    champion_version: "0.9.5"          # Must outperform champion on accuracy and latency
+    required_improvement_pct: 0.0      # 0 = must not regress; positive = must improve by N%
+
+# -----------------------------------------------------------------------------
+# LINEAGE
+# Auto-populated by the publish pipeline. Do not edit manually.
+# -----------------------------------------------------------------------------
+lineage:
+  git_repo: "https://github.com/company/agentic-platform"
+  git_commit_sha: ""                   # Auto-set by Cloud Build
+  pipeline_run_id: ""                  # Vertex Pipelines run ID — auto-set
+  training_dataset_id: ""             # Vertex Dataset ID used for adapter fine-tuning
+  parent_version_id: ""               # Registry ID of the version this was promoted from
+  ml_metadata_context_id: ""          # Vertex ML Metadata context for full artifact lineage
+  sbom_uri: ""                         # Auto-set post-build (CycloneDX SBOM in GCS)
+  build_logs_uri: ""                   # Cloud Build log URI — auto-set
+
+# -----------------------------------------------------------------------------
+# DEPLOYMENT
+# Deployment targets and canary strategy. Managed by Inference Activator.
+# -----------------------------------------------------------------------------
+deployment:
+  targets:
+    - environment: "staging"
+      project: "staging-project"
+      region: "us-central1"
+      endpoint_display_name: "fraud-detection-agent-staging"
+    - environment: "production"
+      project: "prod-project"
+      region: "us-central1"
+      endpoint_display_name: "fraud-detection-agent-prod"
+      multi_region:
+        enabled: true
+        regions: ["us-central1", "us-east1"]
+  canary:
+    enabled: true
+    initial_traffic_pct: 10
+    promotion_interval_minutes: 30
+    promotion_increment_pct: 20         # 10% → 30% → 50% → 70% → 100%
+    auto_promote: true
+    rollback_on_slo_breach: true
+    observation_window_minutes: 15
+  warm_pool:
+    enabled: true
+    min_warm_replicas: 2               # Pre-warmed by Inference Activator
+    warm_up_request_uri: "gs://agent-configs/fraud-detection/warmup/request.json"
+
+# -----------------------------------------------------------------------------
+# GOVERNANCE
+# Approval workflow config for the Stage 6 governance gate.
+# -----------------------------------------------------------------------------
+governance:
+  approval_required: true              # Derived from risk_tier: high → always true
+  approvers:
+    primary:
+      - role: "policy-owner"
+        email: "policy-owners@company.com"
+    secondary:                         # Required for high risk_tier
+      - role: "security-review"
+        email: "security-review@company.com"
+  approval_timeout_hours: 48
+  auto_approve_on_timeout: false
+  audit:
+    log_sink: "projects/prod-project/datasets/agent_audit_log"
+    chronicle_feed: "fraud-agent-publish-events"
+    retention_years: 7
+
+# =============================================================================
+# END OF MANIFEST
+# =============================================================================
