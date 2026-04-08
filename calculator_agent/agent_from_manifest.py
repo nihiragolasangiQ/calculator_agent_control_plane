@@ -170,3 +170,4 @@ if __name__ == "__main__":
     manifest = load_manifest("calculator_agent/manifest/calculator_agent_manifest.yaml")
     asyncio.run(run_from_manifest("what is 12 * 15?", manifest))
     asyncio.run(run_from_manifest("solve this calculus problem: d/dx x^2", manifest))
+    
