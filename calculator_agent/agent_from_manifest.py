@@ -17,7 +17,7 @@ import os
 from dotenv import load_dotenv
 
 # load .env file
-load_dotenv("calculator_agent/.env")
+load_dotenv(".env")
 
 # -----------------------------------------------------------------------------
 # MANIFEST LOADER
@@ -166,8 +166,30 @@ async def run_from_manifest(problem: str, manifest: dict):
 # QUICK TEST — just to make sure loader works
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
- 
+   
+    
     manifest = load_manifest("calculator_agent/manifest/calculator_agent_manifest.yaml")
-    asyncio.run(run_from_manifest("what is 12 * 15?", manifest))
-    asyncio.run(run_from_manifest("solve this calculus problem: d/dx x^2", manifest))
+    
+    print("\n🧮 Calculator Agent (terminal mode)")
+    print("   Type your math problem and press Enter")
+    print("   Type 'exit' to quit")
+    print("-" * 50)
+
+    while True:
+        try:
+            problem = input("\n>").strip()
+            
+            if problem.lower() == "exit":
+                print("👋 Bye!")
+                break
+                
+            if not problem:
+                continue
+                
+            asyncio.run(run_from_manifest(problem, manifest))
+            #TODO: fall back here , if more than a 1 is its idle exit
+        except KeyboardInterrupt:
+            print("\n👋 Bye!")
+            break
+ 
     

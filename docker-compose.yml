@@ -1,0 +1,14 @@
+# =============================================================================
+# docker-compose.yml — Calculator Agent
+# =============================================================================
+services:
+  calculator-agent:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - ./calculator_agent/manifest:/app/calculator_agent/manifest
+    stdin_open: true      # keeps stdin open
+    tty: true             # allocates a terminal

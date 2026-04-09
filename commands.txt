@@ -1,0 +1,2 @@
+UI mode       → docker compose up
+Terminal mode → docker compose run --rm calculator-agent
