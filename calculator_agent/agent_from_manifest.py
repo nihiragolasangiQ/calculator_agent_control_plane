@@ -12,19 +12,33 @@ from google.genai.types import Content, Part
 
 from calculator_agent.config import settings
 from calculator_agent.tools import add, subtract, multiply, divide, escalate
+from calculator_agent.palindrome_tools import (
+    is_palindrome,
+    longest_palindrome_substring,
+    make_palindrome,
+    palindrome_score,
+)
 
 
 # ---------------------------------------------------------------------------
 # TOOL REGISTRY
 # Maps tool_id strings (from manifest) → actual Python callables.
 # Only tools declared in the manifest AND marked allowed:true are loaded.
+# Add new tools here when new agents are introduced.
 # ---------------------------------------------------------------------------
 
 TOOL_REGISTRY = {
+    # Calculator tools
     "add": add,
     "subtract": subtract,
     "multiply": multiply,
     "divide": divide,
+    # Palindrome tools
+    "is_palindrome": is_palindrome,
+    "longest_palindrome_substring": longest_palindrome_substring,
+    "make_palindrome": make_palindrome,
+    "palindrome_score": palindrome_score,
+    # Shared
     "escalate": escalate,
 }
 
