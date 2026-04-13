@@ -7,10 +7,12 @@ import yaml
 from google.adk.agents import Agent
 
 from .config import settings
-from .agent_from_manifest import _load_tools
+from .agent_from_manifest import _load_tools, validate_manifest
 
 with open(settings.manifest.manifest_path, "r") as _f:
     _manifest = yaml.safe_load(_f)
+
+validate_manifest(_manifest)
 
 _instruction = _manifest.get("instruction", "").strip()
 if not _instruction:

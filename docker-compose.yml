@@ -1,7 +1,20 @@
 # =============================================================================
-# docker-compose.yml — Calculator Agent
+# docker-compose.yml — Agent Control Plane
+#
+# Profiles:
+#   default          → agent web UI only (local function tools)
+#   mcp              → agent + both MCP servers
+#
+# Usage:
+#   Local mode:   docker compose up
+#   MCP mode:     docker compose --profile mcp up
 # =============================================================================
+
 services:
+
+  # ---------------------------------------------------------------------------
+  # Agent — ADK web UI
+  # ---------------------------------------------------------------------------
   calculator-agent:
     build: .
     ports:
@@ -10,5 +23,38 @@ services:
       - .env
     volumes:
       - ./calculator_agent/manifest:/app/calculator_agent/manifest
-    stdin_open: true      # keeps stdin open
-    tty: true             # allocates a terminal
+    depends_on:
+      calculator-mcp:
+        condition: service_started
+        required: false
+      palindrome-mcp:
+        condition: service_started
+        required: false
+
+  # ---------------------------------------------------------------------------
+  # Calculator MCP Server (only started with --profile mcp)
+  # ---------------------------------------------------------------------------
+  calculator-mcp:
+    build: .
+    profiles: ["mcp"]
+    command: python -m mcp_servers.calculator_server
+    ports:
+      - "8001:8001"
+    env_file:
+      - .env
+    environment:
+      - CALCULATOR_MCP_PORT=8001
+
+  # ---------------------------------------------------------------------------
+  # Palindrome MCP Server (only started with --profile mcp)
+  # ---------------------------------------------------------------------------
+  palindrome-mcp:
+    build: .
+    profiles: ["mcp"]
+    command: python -m mcp_servers.palindrome_server
+    ports:
+      - "8002:8002"
+    env_file:
+      - .env
+    environment:
+      - PALINDROME_MCP_PORT=8002

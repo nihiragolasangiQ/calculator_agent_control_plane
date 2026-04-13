@@ -1,0 +1,185 @@
+# =============================================================================
+# calculator_mcp_manifest.yaml — Calculator Agent (MCP Mode)
+# Swap in via: MANIFEST_PATH=calculator_agent/manifest/calculator_mcp_manifest.yaml
+# Version schema: v2.0
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# IDENTITY
+# -----------------------------------------------------------------------------
+identity:
+  agent_id: "calculator_agent_mcp_001"
+  name: "calculator_agent"
+  display_name: "Calculator Agent (MCP)"
+  description: >
+    Solves math problems step by step. Handles basic arithmetic
+    and algebra. Escalates complex problems like calculus to human review.
+    Arithmetic tools are served via a remote MCP server.
+  owner:
+    team: "quantum-team"
+    email: "quantum@company.com"
+  version: "2.0.0"
+  status: "active"
+
+
+# -----------------------------------------------------------------------------
+# INSTRUCTION
+# System prompt — single source of truth for agent behaviour
+# -----------------------------------------------------------------------------
+instruction: |
+  You are a precise and helpful calculator agent.
+  Your job is to solve math problems step by step and explain your reasoning clearly.
+
+  CAPABILITIES:
+  - Basic arithmetic: addition, subtraction, multiplication, division
+  - Algebra: solving equations, simplifying expressions
+  - Word problems: extract numbers and operations from text
+
+  RULES:
+  - Always break the problem into clear steps
+  - Show your work at every step
+  - If a problem involves calculus or differential equations → escalate
+  - If you are not confident → escalate, never guess
+  - Always return a clean final answer at the end
+
+  TONE:
+  - Be clear and concise
+  - Explain like you're teaching, not just answering
+
+
+# -----------------------------------------------------------------------------
+# MODEL
+# -----------------------------------------------------------------------------
+model:
+  base_model_id: "gemini-2.5-flash"
+  base_model_source: "google_ai_studio"
+  inference:
+    temperature: 0.1
+    max_output_tokens: 1024
+    top_p: 0.9
+
+
+# -----------------------------------------------------------------------------
+# CAPABILITIES
+# Tools declared as type: mcp_server — no hardcoded Python functions.
+# escalate stays local (human_in_loop) — it is a side-effect function,
+# not remoteable over MCP.
+# -----------------------------------------------------------------------------
+capabilities:
+  modalities:
+    input: ["text"]
+    output: ["text"]
+
+  tools:
+    - tool_id: "calculator_mcp"
+      type: "mcp_server"
+      display_name: "Calculator MCP Server"
+      description: "Remote MCP server providing arithmetic operations."
+      version: "1.0.0"
+      url: "http://localhost:8001/mcp"        # local: http://localhost:8001/mcp
+                                              # docker: http://calculator-mcp:8001/mcp
+      allowed_tool_ids:
+        - "add"
+        - "subtract"
+        - "multiply"
+        - "divide"
+      on_unavailable: "warn"        # fail | warn
+      fallback_tool_id: "add"       # local TOOL_REGISTRY key — used if MCP server is unreachable
+      auth:
+        type: "none"                # none | api_key | bearer
+        secret_ref: ""              # env var name holding credential (empty = no auth)
+      allowed: true
+
+    - tool_id: "escalate"
+      display_name: "Escalation Tool"
+      description: "Routes complex problems to human review. Runs locally."
+      type: "human_in_loop"
+      allowed: true
+
+
+# -----------------------------------------------------------------------------
+# POLICY
+# -----------------------------------------------------------------------------
+policy:
+  confidence_threshold: 0.7
+
+  allowed_problem_types:
+    - "arithmetic"
+    - "algebra"
+    - "word_problems"
+
+  denied_problem_types:
+    - "calculus"
+    - "differential_equations"
+    - "abstract_algebra"
+
+  escalation:
+    enabled: true
+    trigger_on_low_confidence: true
+    trigger_on_denied_problem_type: true
+    escalation_message: "Problem is too complex or confidence is too low. Routing to human review."
+
+  rate_limits:
+    requests_per_minute: 30
+    max_concurrent_sessions: 5
+
+  allowed_callers:
+    - "any"
+
+
+# -----------------------------------------------------------------------------
+# OBSERVABILITY
+# -----------------------------------------------------------------------------
+observability:
+  logging:
+    enabled: true
+    log_level: "INFO"
+    log_tool_calls: true
+    log_escalations: true
+    redact_pii: false
+
+  metrics:
+    enabled: true
+    track:
+      - name: "tool_call_count"
+        description: "How many times each tool was called"
+      - name: "escalation_rate"
+        description: "Fraction of problems escalated to human"
+      - name: "mcp_server_latency_ms"
+        description: "Round-trip latency to the MCP server"
+      - name: "response_latency_ms"
+        description: "End to end response time in milliseconds"
+
+  alerts:
+    - name: "high_escalation_rate"
+      metric: "escalation_rate"
+      threshold: 0.3
+      message: "Too many problems being escalated — model may need retraining"
+
+
+# -----------------------------------------------------------------------------
+# DEPLOYMENT
+# -----------------------------------------------------------------------------
+deployment:
+  targets:
+    - environment: "local"
+      runtime: "adk_web"
+
+    - environment: "staging"
+      runtime: "cloud_run"
+      region: "us-central1"
+
+    - environment: "production"
+      runtime: "cloud_run"
+      region: "us-central1"
+
+  canary:
+    enabled: false
+    initial_traffic_pct: 10
+    increment_pct: 20
+    rollback_on_failure: true
+
+  lifecycle:
+    max_turns: 20
+    session_timeout_seconds: 300
+    graceful_shutdown_seconds: 30

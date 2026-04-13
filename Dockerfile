@@ -27,6 +27,7 @@ RUN pip install --no-cache-dir -r requirements.docker.txt
 # copy project files into container
 # -----------------------------------------------------------------------------
 COPY calculator_agent/ ./calculator_agent/
+COPY mcp_servers/ ./mcp_servers/
 
 # -----------------------------------------------------------------------------
 # STARTUP SCRIPT

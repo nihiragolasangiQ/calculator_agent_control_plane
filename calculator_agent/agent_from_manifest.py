@@ -1,6 +1,7 @@
 # calculator_agent/agent_from_manifest.py
 
 import asyncio
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -8,6 +9,8 @@ import yaml
 from google.adk.agents import Agent
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
+from google.adk.tools.mcp_tool import MCPToolset
+from google.adk.tools.mcp_tool import StreamableHTTPConnectionParams
 from google.genai.types import Content, Part
 
 from calculator_agent.config import settings
@@ -22,9 +25,10 @@ from calculator_agent.palindrome_tools import (
 
 # ---------------------------------------------------------------------------
 # TOOL REGISTRY
-# Maps tool_id strings (from manifest) → actual Python callables.
-# Only tools declared in the manifest AND marked allowed:true are loaded.
-# Add new tools here when new agents are introduced.
+# Maps tool_id strings (from manifest) → Python callables.
+# Used for type: function and type: human_in_loop tools.
+# For type: mcp_server tools, McpToolset is constructed directly from the
+# manifest URL — no entry in this registry is needed.
 # ---------------------------------------------------------------------------
 
 TOOL_REGISTRY = {
@@ -71,7 +75,7 @@ class MergedConfig:
     # lifecycle
     max_turns: int
     session_timeout: int
-    # tools (resolved callables)
+    # tools (resolved callables or McpToolset objects)
     tools: list
 
 
@@ -93,6 +97,76 @@ def load_manifest() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# STEP 1b — MANIFEST VALIDATOR
+# Structural validation at startup — before any agent construction.
+# Catches config errors early rather than at first user request.
+# Does NOT make network calls (MCP server reachability is a runtime concern).
+# ---------------------------------------------------------------------------
+
+def validate_manifest(manifest: dict) -> None:
+    """Validates manifest structure. Raises ValueError on hard errors, prints WARNs."""
+    print("\n  Validating manifest...")
+
+    # Required top-level keys
+    required_keys = ["identity", "instruction", "model", "capabilities", "policy"]
+    for key in required_keys:
+        if key not in manifest:
+            raise ValueError(f"Manifest validation FAILED: missing required key '{key}'")
+
+    errors = []
+    warnings = []
+
+    tools = manifest.get("capabilities", {}).get("tools", [])
+    for tool in tools:
+        tool_id   = tool.get("tool_id", "<unknown>")
+        tool_type = tool.get("type", "function")
+        allowed   = tool.get("allowed", False)
+        version   = tool.get("version")
+
+        if not allowed:
+            print(f"    [SKIP] {tool_id} (allowed: false)")
+            continue
+
+        if version is None:
+            warnings.append(f"{tool_id}: no 'version' field (informational)")
+
+        if tool_type == "mcp_server":
+            url = tool.get("url", "").strip()
+            if not url:
+                errors.append(f"{tool_id}: type=mcp_server but 'url' is missing or empty")
+            else:
+                print(f"    [PASS] {tool_id} (mcp_server → {url})")
+
+            fallback_id = tool.get("fallback_tool_id", "").strip()
+            if fallback_id and fallback_id not in TOOL_REGISTRY:
+                warnings.append(
+                    f"{tool_id}: fallback_tool_id='{fallback_id}' not found in TOOL_REGISTRY — fallback will be skipped"
+                )
+
+        elif tool_type in ("function", "human_in_loop"):
+            if tool_id not in TOOL_REGISTRY:
+                errors.append(
+                    f"{tool_id}: type={tool_type} but tool_id not found in TOOL_REGISTRY"
+                )
+            else:
+                print(f"    [PASS] {tool_id} (function in TOOL_REGISTRY)")
+
+        else:
+            warnings.append(f"{tool_id}: unknown type '{tool_type}' — skipped validation")
+
+    if not tools:
+        warnings.append("No tools declared — agent will run on model knowledge only (no tool calls possible)")
+
+    for w in warnings:
+        print(f"    [WARN] {w}")
+
+    if errors:
+        raise ValueError("Manifest validation FAILED:\n  " + "\n  ".join(errors))
+
+    print(f"  Manifest valid  : {len(tools)} tools checked, {len(warnings)} warnings\n")
+
+
+# ---------------------------------------------------------------------------
 # STEP 2 — CONFIG MERGER
 # Applies env-var layer on top of YAML values.
 # Resolution order: Env Var > YAML > hardcoded default
@@ -107,53 +181,53 @@ def merge_config(manifest: dict) -> MergedConfig:
 
     # --- model: env var wins, then YAML, then settings default ---
     model_name = (
-        settings.agent.model_name                          # env: AGENT_MODEL_NAME
-        if "AGENT_MODEL_NAME" in __import__("os").environ
-        else manifest["model"]["base_model_id"]            # yaml value
+        settings.agent.model_name
+        if "AGENT_MODEL_NAME" in os.environ
+        else manifest["model"]["base_model_id"]
     )
 
     # --- policy: env var wins, then YAML, then settings default ---
     confidence_threshold = (
         settings.policy.confidence_threshold
-        if "CONFIDENCE_THRESHOLD" in __import__("os").environ
+        if "CONFIDENCE_THRESHOLD" in os.environ
         else float(yaml_policy.get("confidence_threshold", settings.policy.confidence_threshold))
     )
 
     allowed_problem_types = (
         settings.policy.allowed_problem_types
-        if "ALLOWED_PROBLEM_TYPES" in __import__("os").environ
+        if "ALLOWED_PROBLEM_TYPES" in os.environ
         else tuple(yaml_policy.get("allowed_problem_types", list(settings.policy.allowed_problem_types)))
     )
 
     denied_problem_types = (
         settings.policy.denied_problem_types
-        if "DENIED_PROBLEM_TYPES" in __import__("os").environ
+        if "DENIED_PROBLEM_TYPES" in os.environ
         else tuple(yaml_policy.get("denied_problem_types", list(settings.policy.denied_problem_types)))
     )
 
     # --- rate limits: env var wins, then YAML, then settings default ---
     requests_per_minute = (
         settings.rate_limits.requests_per_minute
-        if "RATE_LIMIT_RPM" in __import__("os").environ
+        if "RATE_LIMIT_RPM" in os.environ
         else int(yaml_rate_limits.get("requests_per_minute", settings.rate_limits.requests_per_minute))
     )
 
     max_concurrent_sessions = (
         settings.rate_limits.max_concurrent_sessions
-        if "MAX_CONCURRENT_SESSIONS" in __import__("os").environ
+        if "MAX_CONCURRENT_SESSIONS" in os.environ
         else int(yaml_rate_limits.get("max_concurrent_sessions", settings.rate_limits.max_concurrent_sessions))
     )
 
     # --- lifecycle: env var wins, then YAML, then settings default ---
     max_turns = (
         settings.agent.max_turns
-        if "MAX_TURNS" in __import__("os").environ
+        if "MAX_TURNS" in os.environ
         else int(yaml_lifecycle.get("max_turns", settings.agent.max_turns))
     )
 
     session_timeout = (
         settings.agent.session_timeout
-        if "SESSION_TIMEOUT" in __import__("os").environ
+        if "SESSION_TIMEOUT" in os.environ
         else int(yaml_lifecycle.get("session_timeout_seconds", settings.agent.session_timeout))
     )
 
@@ -189,21 +263,111 @@ def merge_config(manifest: dict) -> MergedConfig:
 
 
 # ---------------------------------------------------------------------------
+# AUTH HELPER (used by _load_tools for mcp_server tools)
+# Reads credentials from env vars — secrets never live in the manifest YAML.
+# ---------------------------------------------------------------------------
+
+def _resolve_auth_headers(auth_config: dict) -> dict:
+    """Resolves MCP auth credentials from env vars named in secret_ref.
+
+    Auth types:
+      none     → {} (no credential)
+      api_key  → {"X-API-Key": os.getenv(secret_ref)}
+      bearer   → {"Authorization": "Bearer " + os.getenv(secret_ref)}
+
+    The credential is read once at agent startup and baked into McpToolset.
+    If the credential rotates, restart the process.
+    """
+    auth_type  = auth_config.get("type", "none")
+    secret_ref = auth_config.get("secret_ref", "").strip()
+
+    if auth_type == "none" or not secret_ref:
+        return {}
+
+    credential = os.getenv(secret_ref, "")
+    if not credential:
+        print(f"    Auth WARNING: env var '{secret_ref}' is not set or empty")
+
+    if auth_type == "api_key":
+        return {"X-API-Key": credential}
+    elif auth_type == "bearer":
+        return {"Authorization": f"Bearer {credential}"}
+
+    return {}
+
+
+# ---------------------------------------------------------------------------
 # TOOL LOADER (internal helper used by merge_config)
+# Routes tool declarations to the correct loading path:
+#   type: mcp_server       → McpToolset (remote, URL-based)
+#   type: function         → TOOL_REGISTRY lookup (local Python callable)
+#   type: human_in_loop    → TOOL_REGISTRY lookup (local Python callable)
 # ---------------------------------------------------------------------------
 
 def _load_tools(manifest: dict) -> list:
+    """Resolves tool declarations from the manifest into ADK tool objects.
+
+    McpToolset.__init__ is synchronous-safe — it only instantiates a
+    MCPSessionManager and stores connection params. No I/O happens here.
+    The actual async HTTP connection to the MCP server is deferred until
+    ADK calls get_tools() during the first agent invocation.
+
+    on_unavailable behaviour:
+      "fail" → raise RuntimeError if tool cannot be loaded
+      "warn" → log a warning and skip the tool (agent starts with partial tools)
+    """
     allowed_tools = []
+
     for tool in manifest["capabilities"]["tools"]:
-        tool_id = tool["tool_id"]
-        if tool["allowed"]:
+        tool_id          = tool["tool_id"]
+        tool_type        = tool.get("type", "function")
+        on_unavailable   = tool.get("on_unavailable", "fail")
+
+        if not tool["allowed"]:
+            print(f"    Tool disabled: {tool_id}")
+            continue
+
+        # ── MCP server path ──────────────────────────────────────────────────
+        if tool_type == "mcp_server":
+            url              = tool.get("url", "").strip()
+            allowed_tool_ids = tool.get("allowed_tool_ids") or None  # None = allow all
+            auth_config      = tool.get("auth", {"type": "none", "secret_ref": ""})
+            fallback_tool_id = tool.get("fallback_tool_id", "").strip() or None
+
+            try:
+                headers = _resolve_auth_headers(auth_config)
+                toolset = MCPToolset(
+                    connection_params=StreamableHTTPConnectionParams(
+                        url=url,
+                        headers=headers if headers else None,
+                    ),
+                    tool_filter=allowed_tool_ids,
+                )
+                allowed_tools.append(toolset)
+                filter_note = f"filter={allowed_tool_ids}" if allowed_tool_ids else "no filter"
+                print(f"    Tool loaded  : {tool_id} (mcp_server @ {url}, {filter_note})")
+
+            except Exception as exc:
+                msg = f"MCP toolset '{tool_id}' failed to load: {exc}"
+                if on_unavailable == "fail":
+                    raise RuntimeError(msg) from exc
+
+                # on_unavailable == "warn" — try local fallback before giving up
+                print(f"    [WARN] {msg}")
+                if fallback_tool_id and fallback_tool_id in TOOL_REGISTRY:
+                    allowed_tools.append(TOOL_REGISTRY[fallback_tool_id])
+                    print(f"    [FALLBACK] {tool_id} unreachable → using local '{fallback_tool_id}' function")
+                else:
+                    print(f"    [WARN] No fallback for '{tool_id}' — tool unavailable this session")
+
+        # ── Function / human_in_loop path ────────────────────────────────────
+        else:
             if tool_id in TOOL_REGISTRY:
                 allowed_tools.append(TOOL_REGISTRY[tool_id])
                 print(f"    Tool loaded  : {tool_id}")
             else:
                 print(f"    Tool missing in registry: {tool_id}")
-        else:
-            print(f"    Tool disabled: {tool_id}")
+
     return allowed_tools
 
 
@@ -250,7 +414,7 @@ def build_agent_from_manifest(merged: MergedConfig) -> Agent:
 
 # ---------------------------------------------------------------------------
 # ORCHESTRATOR
-# Load → Merge → Enforce policy → Build → Run
+# Load → Validate → Merge → Enforce policy → Build → Run
 # ---------------------------------------------------------------------------
 
 async def run_from_manifest(problem: str, merged: MergedConfig, agent: Agent):
@@ -287,22 +451,14 @@ async def run_from_manifest(problem: str, merged: MergedConfig, agent: Agent):
 
 # ---------------------------------------------------------------------------
 # ENTRY POINT — terminal mode
+# Pipeline: load → validate → merge → build → REPL loop
+# The entire REPL runs inside a single asyncio.run() so MCPToolset
+# connections persist across questions (not torn down per-question).
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
-    print("\nInitializing Calculator Agent Control Plane...")
-
-    # 1. Load manifest (path from config → env var or default)
-    manifest = load_manifest()
-
-    # 2. Merge env-var layer with YAML layer → single resolved config
-    merged = merge_config(manifest)
-
-    # 3. Build agent once; reuse across the REPL loop
-    agent = build_agent_from_manifest(merged)
-
-    print("\n🧮 Calculator Agent (terminal mode)")
-    print("   Type your math problem and press Enter")
+async def _repl(merged: MergedConfig, agent: Agent):
+    print(f"\n  {merged.display_name} (terminal mode)")
+    print("   Type your problem and press Enter")
     print("   Type 'exit' to quit")
     print("-" * 50)
 
@@ -311,14 +467,25 @@ if __name__ == "__main__":
             problem = input("\n> ").strip()
 
             if problem.lower() == "exit":
-                print("👋 Bye!")
+                print("Bye!")
                 break
 
             if not problem:
                 continue
 
-            asyncio.run(run_from_manifest(problem, merged, agent))
+            await run_from_manifest(problem, merged, agent)
 
         except KeyboardInterrupt:
-            print("\n👋 Bye!")
+            print("\nBye!")
             break
+
+
+if __name__ == "__main__":
+    print("\nInitializing Agent Control Plane...")
+
+    manifest = load_manifest()
+    validate_manifest(manifest)
+    merged = merge_config(manifest)
+    agent = build_agent_from_manifest(merged)
+
+    asyncio.run(_repl(merged, agent))
