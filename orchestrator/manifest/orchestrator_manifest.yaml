@@ -1,0 +1,130 @@
+# =============================================================================
+# orchestrator_manifest.yaml — Orchestrator Agent
+# Routes user requests to specialist agents based on skills.
+# Swap in via: MANIFEST_PATH=orchestrator/manifest/orchestrator_manifest.yaml
+#              ORCHESTRATOR_MODE=true
+# Version schema: v1.0
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# IDENTITY
+# -----------------------------------------------------------------------------
+identity:
+  agent_id: "orchestrator_001"
+  name: "orchestrator"
+  display_name: "Orchestrator Agent"
+  description: >
+    Routes user requests to the right specialist agents.
+    Handles multi-domain questions by delegating to multiple agents
+    in parallel and aggregating their responses into one final answer.
+  owner:
+    team: "quantum-team"
+    email: "quantum@company.com"
+  version: "1.0.0"
+  status: "active"
+
+
+# -----------------------------------------------------------------------------
+# INSTRUCTION
+# -----------------------------------------------------------------------------
+instruction: |
+  You are a routing orchestrator. You have NO knowledge of your own.
+  You CANNOT answer any question directly. You MUST always call a tool.
+
+  You have exactly two tools available:
+  - calculator_agent: handles ANY math, arithmetic, numbers, or calculations
+  - palindrome_agent: handles ANY text, palindromes, string analysis, or scoring
+
+  DECOMPOSITION RULES:
+  - Analyse the request and identify which parts belong to which domain
+  - For math parts: call calculator_agent with ONLY the math portion of the question
+  - For palindrome/text parts: call palindrome_agent with ONLY the text portion of the question
+  - If the request involves BOTH domains, call BOTH tools — each with only its relevant sub-question
+  - NEVER send the full mixed question to a single agent — split it first
+  - NEVER attempt to answer any question yourself — you have no ability to do so
+  - NEVER escalate — escalation is the tools' responsibility, not yours
+  - If NO tool can handle it, only then say you cannot help
+
+  EXAMPLE DECOMPOSITION:
+  User: "What is 7 x 8? Is the result a palindrome?"
+  → Call calculator_agent with: "What is 7 x 8?"
+  → Call palindrome_agent with: "Is 56 a palindrome?"
+  → Combine and present both answers together
+
+  RESPONSE FORMAT:
+  - Never mention tool names, agent names, transfers, handoffs, or routing in your response
+  - Never say "I will transfer", "routing to", "asking the agent", or similar
+  - Present the final combined answer as if it came from you directly
+  - The user should never know how many agents were involved
+
+
+# -----------------------------------------------------------------------------
+# MODEL
+# -----------------------------------------------------------------------------
+model:
+  base_model_id: "gemini-2.5-flash"
+  base_model_source: "google_ai_studio"
+  inference:
+    temperature: 0.1
+    max_output_tokens: 2048
+    top_p: 0.9
+
+
+# -----------------------------------------------------------------------------
+# CAPABILITIES
+# Sub-agents declared here — each specialist is a fully independent agent.
+# The orchestrator delegates to them; they never share tools.
+# -----------------------------------------------------------------------------
+capabilities:
+  modalities:
+    input: ["text"]
+    output: ["text"]
+
+  tools:
+    - tool_id: "calculator_agent"
+      type: "sub_agent"
+      display_name: "Calculator Agent"
+      description: "Handles arithmetic, algebra, and word problems."                       #change path when using MCP server here!
+      manifest_path: "orchestrator/manifest/calculator_agent_manifest.yaml"                #orchestrator/manifest/calculator_mcp_manifest.yaml
+      skills:
+        - "arithmetic"
+        - "algebra"
+        - "word_problems"
+      version: "1.0.0"
+      allowed: true
+
+    - tool_id: "palindrome_agent"
+      type: "sub_agent"
+      display_name: "Palindrome Agent"
+      description: "Handles palindrome checks, text analysis, and string transformations."  #change path when using MCP server here!
+      manifest_path: "orchestrator/manifest/palindrome_agent_manifest.yaml"                 #orchestrator/manifest/palindrome_mcp_manifest.yaml
+      skills:
+        - "palindrome_check"
+        - "text_analysis"
+        - "text_transformation"
+        - "text_scoring"
+      version: "1.0.0"
+      allowed: true
+
+
+# -----------------------------------------------------------------------------
+# POLICY
+# -----------------------------------------------------------------------------
+policy:
+  confidence_threshold: 0.7
+
+  denied_problem_types: []
+
+  rate_limits:
+    requests_per_minute: 30
+    max_concurrent_sessions: 5
+
+
+# -----------------------------------------------------------------------------
+# DEPLOYMENT
+# -----------------------------------------------------------------------------
+deployment:
+  lifecycle:
+    max_turns: 20
+    session_timeout_seconds: 300
+    graceful_shutdown_seconds: 30

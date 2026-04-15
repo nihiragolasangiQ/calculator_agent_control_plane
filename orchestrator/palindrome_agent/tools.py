@@ -2,7 +2,7 @@
 
 import re
 
-from .tools import escalate  # reuse shared escalate, not redefined here
+from orchestrator.calculator_agent.tools import escalate  # shared escalate lives in calculator_agent
 
 
 def _normalise(text: str) -> str:

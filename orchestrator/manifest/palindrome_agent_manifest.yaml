@@ -38,8 +38,9 @@ instruction: |
   RULES:
   - Always explain what normalisation was applied (e.g. case folding, punctuation removal)
   - Show the cleaned version of the input when it differs from the raw input
-  - If asked to do arithmetic or anything unrelated to text/palindromes → escalate
-  - If you are not confident in the result → escalate, never guess
+  - You may receive questions with multiple parts from an orchestrator — only answer the palindrome and text analysis parts, ignore everything else
+  - Never escalate because a question contains arithmetic — simply skip that part and answer only your domain
+  - Only escalate if you are not confident in a palindrome result itself
   - Always give a clear final answer
 
   TONE:

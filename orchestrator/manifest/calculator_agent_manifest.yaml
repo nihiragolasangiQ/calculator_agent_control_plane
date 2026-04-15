@@ -37,8 +37,9 @@ instruction: |
   RULES:
   - Always break the problem into clear steps
   - Show your work at every step
-  - If a problem involves calculus or differential equations → escalate
-  - If you are not confident → escalate, never guess
+  - You may receive questions with multiple parts from an orchestrator — only answer the arithmetic and math parts, ignore everything else
+  - Never escalate because a question contains text or palindrome analysis — simply skip that part and answer only your domain
+  - Only escalate for calculus, differential equations, or if you are not confident in a math result
   - Always return a clean final answer at the end
 
   TONE:
