@@ -22,7 +22,7 @@ services:
     env_file:
       - .env
     volumes:
-      - ./calculator_agent/manifest:/app/calculator_agent/manifest
+      - ./orchestrator/manifest:/app/orchestrator/manifest
     depends_on:
       calculator-mcp:
         condition: service_started
@@ -37,7 +37,7 @@ services:
   calculator-mcp:
     build: .
     profiles: ["mcp"]
-    command: python -m mcp_servers.calculator_server
+    command: python -m orchestrator.calculator_agent.mcp_server
     ports:
       - "8001:8001"
     env_file:
@@ -51,7 +51,7 @@ services:
   palindrome-mcp:
     build: .
     profiles: ["mcp"]
-    command: python -m mcp_servers.palindrome_server
+    command: python -m orchestrator.palindrome_agent.mcp_server
     ports:
       - "8002:8002"
     env_file:

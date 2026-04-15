@@ -1,5 +1,5 @@
 # =============================================================================
-# Dockerfile — Calculator Agent
+# Dockerfile — Control Plane
 # Base: Python 3.11 slim (stable for ADK)
 # =============================================================================
 
@@ -26,8 +26,7 @@ RUN pip install --no-cache-dir -r requirements.docker.txt
 # CODE
 # copy project files into container
 # -----------------------------------------------------------------------------
-COPY calculator_agent/ ./calculator_agent/
-COPY mcp_servers/ ./mcp_servers/
+COPY orchestrator/ ./orchestrator/
 
 # -----------------------------------------------------------------------------
 # STARTUP SCRIPT

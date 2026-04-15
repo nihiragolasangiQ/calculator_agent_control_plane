@@ -1,29 +1,24 @@
 """
 Calculator MCP Server — exposes arithmetic tools via the MCP protocol.
 
-Wraps calculator_agent/tools.py. No logic is duplicated here.
+Wraps orchestrator/calculator_agent/tools.py. No logic is duplicated here.
 escalate is intentionally excluded — it is a local side-effect function
 and must not be remoted over MCP.
 
 Run:
-    python -m mcp_servers.calculator_server
+    python -m orchestrator.calculator_agent.mcp_server
 
 Listens on: http://0.0.0.0:8001/mcp  (streamable-http transport)
-
-Concurrency: FastMCP / uvicorn handles concurrent HTTP connections via
-async handlers. Each tool call is a stateless HTTP request — no shared
-mutable state between calls.
 """
 
 import os
 import sys
 
-# Allow running from the project root
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Allow running from the project root (3 levels up from this file)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-# Set port before FastMCP initializes — it reads settings at import time
 from mcp.server.fastmcp import FastMCP
-from calculator_agent.tools import (
+from orchestrator.calculator_agent.tools import (
     add as _add,
     subtract as _subtract,
     multiply as _multiply,

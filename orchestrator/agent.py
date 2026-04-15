@@ -1,4 +1,4 @@
-# calculator_agent/agent.py
+# orchestrator/agent.py
 # Entry point for `adk web` — builds root_agent from the YAML manifest.
 # Tools are loaded dynamically from TOOL_REGISTRY based on the manifest,
 # so swapping MANIFEST_PATH switches the agent completely (tools + model + instruction).

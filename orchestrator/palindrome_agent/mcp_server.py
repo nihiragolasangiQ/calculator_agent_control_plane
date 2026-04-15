@@ -1,29 +1,24 @@
 """
 Palindrome MCP Server — exposes palindrome analysis tools via the MCP protocol.
 
-Wraps calculator_agent/palindrome_tools.py. No logic is duplicated here.
+Wraps orchestrator/palindrome_agent/tools.py. No logic is duplicated here.
 escalate is intentionally excluded — it is a local side-effect function
 and must not be remoted over MCP.
 
 Run:
-    python -m mcp_servers.palindrome_server
+    python -m orchestrator.palindrome_agent.mcp_server
 
 Listens on: http://0.0.0.0:8002/mcp  (streamable-http transport)
-
-Concurrency: FastMCP / uvicorn handles concurrent HTTP connections via
-async handlers. Each tool call is a stateless HTTP request — no shared
-mutable state between calls.
 """
 
 import os
 import sys
 
-# Allow running from the project root
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Allow running from the project root (3 levels up from this file)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-# Set port before FastMCP initializes — it reads settings at import time
 from mcp.server.fastmcp import FastMCP
-from calculator_agent.palindrome_tools import (
+from orchestrator.palindrome_agent.tools import (
     is_palindrome as _is_palindrome,
     longest_palindrome_substring as _longest,
     make_palindrome as _make,

@@ -1,4 +1,4 @@
-# calculator_agent/agent_from_manifest.py
+# orchestrator/agent_from_manifest.py
 
 import asyncio
 import os
@@ -11,11 +11,12 @@ from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.adk.tools.mcp_tool import MCPToolset
 from google.adk.tools.mcp_tool import StreamableHTTPConnectionParams
+from google.adk.tools.agent_tool import AgentTool
 from google.genai.types import Content, Part
 
-from calculator_agent.config import settings
-from calculator_agent.tools import add, subtract, multiply, divide, escalate
-from calculator_agent.palindrome_tools import (
+from .config import settings
+from .calculator_agent.tools import add, subtract, multiply, divide, escalate
+from .palindrome_agent.tools import (
     is_palindrome,
     longest_palindrome_substring,
     make_palindrome,
@@ -77,6 +78,8 @@ class MergedConfig:
     session_timeout: int
     # tools (resolved callables or McpToolset objects)
     tools: list
+    # sub_agents (ADK Agent objects — populated for orchestrator manifests)
+    sub_agents: list
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +153,20 @@ def validate_manifest(manifest: dict) -> None:
                 )
             else:
                 print(f"    [PASS] {tool_id} (function in TOOL_REGISTRY)")
+
+        elif tool_type == "sub_agent":
+            manifest_path = tool.get("manifest_path", "").strip()
+            if not manifest_path:
+                errors.append(f"{tool_id}: type=sub_agent but 'manifest_path' is missing or empty")
+            else:
+                resolved = Path(manifest_path)
+                if not resolved.is_absolute():
+                    resolved = Path(settings.manifest.manifest_path).parent.parent.parent / manifest_path
+                if not resolved.exists():
+                    errors.append(f"{tool_id}: sub_agent manifest not found at '{manifest_path}'")
+                else:
+                    skills = tool.get("skills", [])
+                    print(f"    [PASS] {tool_id} (sub_agent → {manifest_path}, skills={skills})")
 
         else:
             warnings.append(f"{tool_id}: unknown type '{tool_type}' — skipped validation")
@@ -231,8 +248,9 @@ def merge_config(manifest: dict) -> MergedConfig:
         else int(yaml_lifecycle.get("session_timeout_seconds", settings.agent.session_timeout))
     )
 
-    # --- tools: always resolved from manifest ---
+    # --- tools and sub_agents: always resolved from manifest ---
     tools = _load_tools(manifest)
+    sub_agents = _load_sub_agents(manifest)
 
     instruction = manifest.get("instruction", "").strip()
     if not instruction:
@@ -253,6 +271,7 @@ def merge_config(manifest: dict) -> MergedConfig:
         max_turns=max_turns,
         session_timeout=session_timeout,
         tools=tools,
+        sub_agents=sub_agents,
     )
 
     print(f"  Config merged   : model={merged.model_name} | "
@@ -372,6 +391,45 @@ def _load_tools(manifest: dict) -> list:
 
 
 # ---------------------------------------------------------------------------
+# SUB-AGENT LOADER (internal helper used by merge_config)
+# Handles type: sub_agent tools — builds full ADK Agent objects from their
+# own manifests. Each sub-agent is independent: own tools, own instruction,
+# own model. They have no awareness of the orchestrator or each other.
+# ---------------------------------------------------------------------------
+
+def _load_sub_agents(manifest: dict) -> list:
+    """Builds ADK Agent objects for every type: sub_agent tool declaration."""
+    sub_agents = []
+
+    for tool in manifest["capabilities"]["tools"]:
+        if not tool.get("allowed", False):
+            continue
+        if tool.get("type") != "sub_agent":
+            continue
+
+        tool_id       = tool["tool_id"]
+        manifest_path = tool.get("manifest_path", "").strip()
+
+        # Resolve path relative to project root (3 levels up from manifest file)
+        resolved = Path(manifest_path)
+        if not resolved.is_absolute():
+            resolved = Path(settings.manifest.manifest_path).parent.parent.parent / manifest_path
+
+        with open(resolved, "r") as f:
+            sub_manifest = yaml.safe_load(f)
+
+        print(f"\n  Loading sub-agent: {tool_id}")
+        validate_manifest(sub_manifest)
+        sub_merged = merge_config(sub_manifest)
+        sub_agent  = build_agent_from_manifest(sub_merged)
+        agent_tool = AgentTool(agent=sub_agent)
+        sub_agents.append(agent_tool)
+        print(f"  Sub-agent ready : {tool_id} (AgentTool, skills={tool.get('skills', [])})")
+
+    return sub_agents
+
+
+# ---------------------------------------------------------------------------
 # STEP 3 — POLICY ENFORCER
 # Validates every request against merged config before it reaches the agent.
 # Control plane responsibility — agent code knows nothing about this.
@@ -399,16 +457,18 @@ def enforce_policy(problem: str, merged: MergedConfig) -> dict:
 def build_agent_from_manifest(merged: MergedConfig) -> Agent:
     print(f"\n  Building agent  : {merged.display_name}")
 
+    all_tools = merged.tools + merged.sub_agents
+
     agent = Agent(
         name=merged.name,
         model=merged.model_name,
         description=merged.description,
         instruction=merged.instruction,
-        tools=merged.tools,
+        tools=all_tools,
     )
 
     print(f"  Model           : {merged.model_name}")
-    print(f"  Tools           : {len(merged.tools)} loaded")
+    print(f"  Tools           : {len(merged.tools)} function/mcp tools + {len(merged.sub_agents)} agent tools = {len(all_tools)} total")
     return agent
 
 

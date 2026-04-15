@@ -10,7 +10,7 @@ RUN_MODE=${RUN_MODE:-ui}
 echo "Starting Agent Control Plane (RUN_MODE=${RUN_MODE})..."
 
 if [ "$RUN_MODE" = "terminal" ]; then
-    exec python -m calculator_agent.agent_from_manifest #run locally
+    exec python -m orchestrator.agent_from_manifest #run locally
 else
     exec adk web /app --port 8000 --host 0.0.0.0
 fi
