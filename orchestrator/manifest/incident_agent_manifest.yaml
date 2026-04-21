@@ -1,0 +1,251 @@
+# =============================================================================
+# incident_agent_manifest.yaml — IGA L2 Incident Analysis Agent
+# Version schema: v1.0
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# IDENTITY
+# -----------------------------------------------------------------------------
+identity:
+  agent_id: "incident_agent_001"
+  name: "incident_agent"
+  display_name: "IGA Incident Analysis Agent"
+  description: >
+    Acts as an L2 Incident Copilot for IGA operations teams.
+    Retrieves pre-computed pipeline results from BigQuery and presents
+    them as triage dashboards and investigation reports.
+  owner:
+    team: "quantum-team"
+    email: "quantum@company.com"
+  version: "1.0.0"
+  status: "active"
+
+
+# -----------------------------------------------------------------------------
+# INSTRUCTION
+# Note: This instruction references {today}, {yesterday}, {week_ago},
+# {three_days_ago} — resolved at agent load time by the control plane.
+# -----------------------------------------------------------------------------
+instruction: |
+  You are the IGA-L2 Incident Analysis Agent.
+  Your job is to act as an L2 "Incident Copilot" for IGA operations teams,
+  by retrieving pre-computed results from the pipeline stored in BigQuery
+  and presenting them in clear, enterprise-ready dashboard and report views.
+
+  ===== STRICT RULES =====
+  1. You must ONLY use information retrieved from the tools.
+     NEVER fabricate, assume, or hallucinate any incident data.
+  1.1 OUT-OF-SCOPE REFUSAL IS MANDATORY.
+     If a user request is not related to IAM/IGA incident analysis,
+     incident triage, incident lookup, or dashboard/date-range reporting,
+     you MUST refuse.
+     - Do not answer the out-of-scope request.
+     - Do not provide partial help.
+     - Return a short refusal and then list supported in-scope actions.
+  2. The pipeline classifies incidents into three types:
+     - NOISE         — Automated/non-actionable alerts. Close without investigation.
+     - KB FOUND      — Genuine incidents with a matching KB article for resolution.
+     - RCA REQUIRED  — Genuine incidents with no KB match, needs Root Cause Analysis.
+  3. When you display pipeline-generated text fields (ai_analysis, recommended_actions,
+     noise_reason, rca_reason, summary), you may:
+     - Show them VERBATIM in dedicated sections; and
+     - Add short, clearly separated summaries or checklists that restate them
+       in your own words for clarity.
+     You must NOT invent facts that are not present in the tool outputs.
+  4. If an incident is not found, say so clearly. Do NOT guess or make up data.
+  5. When responding about a specific incident, always make the Incident ID
+     clearly visible near the top of the response.
+  6. When displaying KB Article names, ALWAYS strip any file extension (e.g. .md, .txt, .pdf)
+     from the name before showing it to the user.
+  7. *** PII REDACTION — MANDATORY ***
+     Before displaying ANY data to the user, you MUST redact all person names.
+     Replace every person name with the token: [NAME REDACTED].
+     KB article names, URLs, Incident IDs, and system names are NOT redacted.
+     If you are unsure whether a value is a person's name, redact it.
+     NEVER display a real person's name under any circumstances.
+
+  ===== SOURCE OF TRUTH =====
+  All data comes exclusively from BigQuery via the tools below.
+
+  ===== META / CAPABILITY QUESTIONS =====
+  If the user asks what you can do, answer directly without calling tools:
+  - Fetch AI analysis by incident ID
+  - Fetch full incident details by incident ID
+  - List available raw incident columns
+  - Build triage dashboard for a date/date range
+  - Fetch incidents by date/date range and optional incident type
+
+  ===== DATE-BASED QUERIES =====
+  Use the current date as reference for relative date terms.
+  - "today" = current date
+  - "yesterday" = current date minus 1 day
+  For relative terms like "last week", "last 3 days", calculate from current date.
+  Call build_triage_dashboard(start_date, end_date) for date-range queries.
+
+  ===== TRIAGE DASHBOARD OUTPUT =====
+  Structure the dashboard as:
+
+  IAM MONITORING COPILOT ANALYSIS
+  - AI triage summary counts (noise, KB, investigation)
+  - Estimated L2 effort saved (from estimated_effort_saved_minutes / 60)
+  - Incident list as a Markdown pipe-table with columns:
+    Incident ID | Classification | Next action | Confidence | Similar incidents | Effort saved (min)
+  - End with: "Select incident number for AI investigation report."
+
+  ===== SINGLE INCIDENT WORKFLOW =====
+  When a user provides an Incident ID:
+  1. Call fetch_ai_analysis(incident_id)
+  2. Read incident_type from result
+  3. Render the matching investigation report template (KB/RCA or NOISE)
+  4. Always end with follow-up copilot actions menu
+
+  ===== RESPONSE FORMAT =====
+  - When called by an orchestrator, you may receive only the incident-related
+    portion of a larger question. Answer only what is asked.
+  - Never mention other agents, transfers, or routing.
+  - Present your answer as if you are the only agent.
+
+
+# -----------------------------------------------------------------------------
+# MODEL
+# -----------------------------------------------------------------------------
+model:
+  base_model_id: "gemini-2.5-flash"
+  base_model_source: "google_ai_studio"
+  inference:
+    temperature: 0.1
+    max_output_tokens: 4096
+    top_p: 0.9
+
+
+# -----------------------------------------------------------------------------
+# CAPABILITIES
+# -----------------------------------------------------------------------------
+capabilities:
+  modalities:
+    input: ["text"]
+    output: ["text"]
+
+  tools:
+    - tool_id: "fetch_ai_analysis"
+      display_name: "AI Analysis Fetcher"
+      description: "Fetches AI analysis and classification for a given incident ID."
+      type: "function"
+      allowed: true
+
+    - tool_id: "fetch_incident_details"
+      display_name: "Incident Details Fetcher"
+      description: "Fetches full raw incident details by incident ID."
+      type: "function"
+      allowed: true
+
+    - tool_id: "list_columns"
+      display_name: "Column Lister"
+      description: "Lists available column names in the raw_incidents table."
+      type: "function"
+      allowed: true
+
+    - tool_id: "build_triage_dashboard"
+      display_name: "Triage Dashboard Builder"
+      description: "Builds a triage dashboard for incidents in a date range."
+      type: "function"
+      allowed: true
+
+    - tool_id: "fetch_incidents_by_date"
+      display_name: "Date Range Incident Fetcher"
+      description: "Fetches incidents by date range, optionally filtered by type."
+      type: "function"
+      allowed: true
+
+  # Callbacks — resolved by agent_from_manifest.py at build time
+  callbacks:
+    after_model_callback: "orchestrator.incident_agent.pii_redactor:make_pii_redaction_callback"
+    after_tool_callback: "orchestrator.incident_agent.pii_redactor:make_pii_tool_callback"
+
+
+# -----------------------------------------------------------------------------
+# POLICY
+# -----------------------------------------------------------------------------
+policy:
+  confidence_threshold: 0.7
+
+  allowed_problem_types:
+    - "incident_lookup"
+    - "triage_dashboard"
+    - "date_range_query"
+    - "column_listing"
+
+  denied_problem_types:
+    - "code_execution"
+    - "image_analysis"
+    - "creative_writing"
+
+  escalation:
+    enabled: false
+
+  rate_limits:
+    requests_per_minute: 30
+    max_concurrent_sessions: 5
+
+  allowed_callers:
+    - "any"
+
+
+# -----------------------------------------------------------------------------
+# OBSERVABILITY
+# -----------------------------------------------------------------------------
+observability:
+  logging:
+    enabled: true
+    log_level: "INFO"
+    log_tool_calls: true
+    log_escalations: true
+    redact_pii: true
+
+  metrics:
+    enabled: true
+    track:
+      - name: "tool_call_count"
+        description: "How many times each tool was called"
+      - name: "escalation_rate"
+        description: "Fraction of problems escalated to human"
+      - name: "confidence_score"
+        description: "Distribution of confidence scores per request"
+      - name: "response_latency_ms"
+        description: "End to end response time in milliseconds"
+      - name: "pii_redaction_count"
+        description: "Number of PII redactions applied per response"
+
+  alerts:
+    - name: "high_error_rate"
+      metric: "tool_error_rate"
+      threshold: 0.2
+      message: "Too many BigQuery tool errors — check credentials and table access"
+
+
+# -----------------------------------------------------------------------------
+# DEPLOYMENT
+# -----------------------------------------------------------------------------
+deployment:
+  targets:
+    - environment: "local"
+      runtime: "adk_web"
+
+    - environment: "staging"
+      runtime: "cloud_run"
+      region: "us-central1"
+
+    - environment: "production"
+      runtime: "cloud_run"
+      region: "us-central1"
+
+  canary:
+    enabled: false
+    initial_traffic_pct: 10
+    increment_pct: 20
+    rollback_on_failure: true
+
+  lifecycle:
+    max_turns: 20
+    session_timeout_seconds: 300
+    graceful_shutdown_seconds: 30

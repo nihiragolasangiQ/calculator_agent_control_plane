@@ -1,60 +1,11 @@
-# =============================================================================
-# docker-compose.yml — Agent Control Plane
-#
-# Profiles:
-#   default          → agent web UI only (local function tools)
-#   mcp              → agent + both MCP servers
-#
-# Usage:
-#   Local mode:   docker compose up
-#   MCP mode:     docker compose --profile mcp up
-# =============================================================================
-
 services:
 
-  # ---------------------------------------------------------------------------
-  # Agent — ADK web UI
-  # ---------------------------------------------------------------------------
-  calculator-agent:
+  control-plane:
     build: .
     ports:
       - "8000:8000"
     env_file:
       - .env
     volumes:
+      # mount manifests so you can edit them without rebuilding the image
       - ./orchestrator/manifest:/app/orchestrator/manifest
-    depends_on:
-      calculator-mcp:
-        condition: service_started
-        required: false
-      palindrome-mcp:
-        condition: service_started
-        required: false
-
-  # ---------------------------------------------------------------------------
-  # Calculator MCP Server (only started with --profile mcp)
-  # ---------------------------------------------------------------------------
-  calculator-mcp:
-    build: .
-    profiles: ["mcp"]
-    command: python -m orchestrator.calculator_agent.mcp_server
-    ports:
-      - "8001:8001"
-    env_file:
-      - .env
-    environment:
-      - CALCULATOR_MCP_PORT=8001
-
-  # ---------------------------------------------------------------------------
-  # Palindrome MCP Server (only started with --profile mcp)
-  # ---------------------------------------------------------------------------
-  palindrome-mcp:
-    build: .
-    profiles: ["mcp"]
-    command: python -m orchestrator.palindrome_agent.mcp_server
-    ports:
-      - "8002:8002"
-    env_file:
-      - .env
-    environment:
-      - PALINDROME_MCP_PORT=8002

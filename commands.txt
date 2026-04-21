@@ -1,88 +1,31 @@
-# =============================================================================
-# commands.txt — Quick reference for running the Agent Control Plane
-# =============================================================================
+# commands.txt — quick reference
 
-
-# -----------------------------------------------------------------------------
-# SETUP
-# -----------------------------------------------------------------------------
-
-# Install dependencies
+# setup
 pip install -r requirements.txt
-
-# Copy env template and fill in your API key
 cp .env.example .env
+gcloud auth application-default login
 
+# single agent (default)
+adk web .
+adk web . --port 8080
+python -m orchestrator.agent
 
-# -----------------------------------------------------------------------------
-# LOCAL MODE — function tools, no MCP servers needed
-# -----------------------------------------------------------------------------
+# orchestrator mode — auto-discovers all agents in orchestrator/manifest/
+ORCHESTRATOR_MODE=true adk web .
 
-# Web UI — calculator agent
-adk web . --port 8000
+# add a new agent: drop a *_manifest.yaml into orchestrator/manifest/ and restart
+# test a single agent in isolation (bypasses orchestrator)
+MANIFEST_PATH=orchestrator/manifest/my_agent_manifest.yaml adk web .
 
-# Web UI — palindrome agent
-MANIFEST_PATH=calculator_agent/manifest/palindrome_agent_manifest.yaml adk web . --port 8000
+# runtime overrides — any YAML value can be set inline
+AGENT_MODEL_NAME=gemini-2.5-pro adk web .
+CONFIDENCE_THRESHOLD=0.9 adk web .
+BQ_PROJECT=my-other-project adk web .
+ENABLE_LLM_POLICY_GUARDRAIL=0 adk web .
+GUARDRAIL_FAIL_CLOSED=0 adk web .
 
-# Terminal REPL — calculator agent
-python -m calculator_agent.agent_from_manifest
-
-# Terminal REPL — palindrome agent
-MANIFEST_PATH=calculator_agent/manifest/palindrome_agent_manifest.yaml python -m calculator_agent.agent_from_manifest
-
-
-# -----------------------------------------------------------------------------
-# MCP MODE — tools served as standalone HTTP servers
-# Start servers first, then run the agent
-# -----------------------------------------------------------------------------
-
-# Terminal 1 — calculator MCP server (port 8001)
-python -m mcp_servers.calculator_server
-
-# Terminal 2 — palindrome MCP server (port 8002)
-python -m mcp_servers.palindrome_server
-
-# Terminal 3 — agent using MCP tools (web UI)
-MANIFEST_PATH=calculator_agent/manifest/calculator_mcp_manifest.yaml adk web . --port 8000
-
-# Terminal 3 — agent using MCP tools (terminal REPL)
-MANIFEST_PATH=calculator_agent/manifest/calculator_mcp_manifest.yaml python -m calculator_agent.agent_from_manifest
-
-# Palindrome agent in MCP mode
-MANIFEST_PATH=calculator_agent/manifest/palindrome_mcp_manifest.yaml python -m calculator_agent.agent_from_manifest
-
-
-# -----------------------------------------------------------------------------
-# DOCKER MODE
-# -----------------------------------------------------------------------------
-
-# Build image
-docker compose build
-
-# Run agent only (local function tools)
-docker compose up
-
-# Run agent + both MCP servers
-# (set MANIFEST_PATH to an MCP manifest in .env first,
-#  and update manifest URLs to use Docker service names:
-#    calculator_mcp_manifest.yaml → url: http://calculator-mcp:8001/mcp
-#    palindrome_mcp_manifest.yaml → url: http://palindrome-mcp:8002/mcp)
-docker compose --profile mcp up
-
-# Stop all containers
-docker compose down
-
-# Rebuild after code changes
-docker compose build && docker compose up
-
-
-# -----------------------------------------------------------------------------
-# SWITCHING AGENTS
-# Change MANIFEST_PATH in .env or pass it inline — no code changes needed
-# -----------------------------------------------------------------------------
-
-# Available manifests:
-#   calculator_agent/manifest/calculator_agent_manifest.yaml   → calculator, local tools
-#   calculator_agent/manifest/palindrome_agent_manifest.yaml   → palindrome, local tools
-#   calculator_agent/manifest/calculator_mcp_manifest.yaml     → calculator, MCP tools
-#   calculator_agent/manifest/palindrome_mcp_manifest.yaml     → palindrome, MCP tools
+# diagnostics
+adk --version
+gcloud auth application-default print-access-token
+bq ls gsk-corp-ai-tech-ops-dev:snow
+ORCHESTRATOR_MODE=true adk web . 2>&1 | head -50

@@ -1,327 +1,603 @@
-# Agent Control Plane
+# IGA Incident Analysis Agent — Control Plane
 
-A manifest-driven AI agent platform built with [Google ADK](https://google.github.io/adk-docs/) and Gemini. Drop a YAML file, get a working agent. Change the YAML, the agent changes. No code edits required.
+An enterprise-grade, manifest-driven AI agent platform built on [Google ADK](https://google.github.io/adk-docs/) and Gemini 2.5 Flash.
 
-Calculator and Palindrome agents are the learning vehicles — the real goal is an enterprise-grade platform where new agents are deployed by writing a manifest, not by touching Python.
+The system acts as an **L2 Incident Copilot** for IGA (Identity Governance & Administration) operations teams. It reads pre-computed pipeline results from BigQuery and surfaces them as triage dashboards and investigation reports — with enforced PII redaction, LLM policy guardrails, and a full orchestration layer.
+
+**Core philosophy:** Drop a YAML file, get a working agent. Change the YAML, the agent changes. No Python edits required.
 
 ---
 
 ## Table of Contents
 
-- [How It Works](#how-it-works)
+- [Architecture Overview](#architecture-overview)
 - [Project Structure](#project-structure)
-- [The Three Layers](#the-three-layers)
+- [How It Works — Startup Pipeline](#how-it-works--startup-pipeline)
+- [How It Works — Request Lifecycle](#how-it-works--request-lifecycle)
+- [The Three Config Layers](#the-three-config-layers)
 - [Running Modes](#running-modes)
-  - [Local Mode — function tools, no servers needed](#local-mode)
-  - [MCP Mode — enterprise, tools as HTTP servers](#mcp-mode)
+  - [Mode 1 — Single Agent (default)](#mode-1--single-agent-default)
+  - [Mode 2 — Orchestrator Mode](#mode-2--orchestrator-mode)
+- [Security & Guardrails](#security--guardrails)
+- [BigQuery Data Layer](#bigquery-data-layer)
 - [Adding a New Agent](#adding-a-new-agent)
 - [Manifest Reference](#manifest-reference)
-- [Env Var Overrides](#env-var-overrides)
-- [MCP Fallback Behaviour](#mcp-fallback-behaviour)
-- [Available Agents](#available-agents)
+- [Environment Variable Reference](#environment-variable-reference)
 
 ---
 
-## How It Works
+## Architecture Overview
 
 ```
-.env  +  manifest.yaml
-         ↓
-      config.py          reads env vars → frozen dataclasses (settings singleton)
-         ↓
-  agent_from_manifest.py
-    load_manifest()      reads YAML from disk
-    validate_manifest()  structural check at startup — catches errors before first request
-    merge_config()       env vars win over YAML, YAML wins over hardcoded defaults
-    enforce_policy()     blocks denied problem types before Gemini ever sees the request
-    build_agent()        constructs ADK Agent with resolved model + tools + instruction
-         ↓
-      Runner → Gemini → tool calls → response
+┌─────────────────────────────────────────────────────────────────┐
+│                        User Interface                           │
+│               (ADK Web UI  /  Terminal REPL)                    │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │
+            ┌───────────────▼───────────────┐
+            │        ORCHESTRATOR           │  ← ORCHESTRATOR_MODE=true
+            │   (routes, never answers)     │
+            └───────────────┬───────────────┘
+                            │  AgentTool call
+            ┌───────────────▼───────────────┐
+            │     IGA INCIDENT AGENT        │  ← ORCHESTRATOR_MODE=false (direct)
+            │   Gemini 2.5 Flash / ADK      │
+            └───────────────┬───────────────┘
+                            │  tool call
+            ┌───────────────▼───────────────┐
+            │        TOOL LAYER             │
+            │  LLM Policy Guardrail check   │
+            │  → BigQuery (ADC auth)        │
+            └───────────────┬───────────────┘
+                            │  result
+            ┌───────────────▼───────────────┐
+            │      CALLBACK LAYER           │
+            │  after_tool: capture PII      │
+            │  after_model: redact PII      │
+            └───────────────┬───────────────┘
+                            │
+                     Final Response
 ```
-
-Every value the agent uses — system prompt, model, tools, rate limits, policy — comes from the manifest. The Python code is the engine. The YAML is the config.
 
 ---
 
 ## Project Structure
 
 ```
-calculator_agent_control_plane/
+control_plane/
 │
-├── .env                                    # Your secrets — never committed
-├── .env.example                            # Template — copy to .env
-│
-├── calculator_agent/
-│   ├── __init__.py                         # Lazy root_agent export for ADK web
-│   ├── agent.py                            # ADK web entry point — builds root_agent
-│   ├── agent_from_manifest.py              # Full control plane pipeline (terminal + shared logic)
-│   ├── config.py                           # Env-var layer — frozen dataclasses singleton
-│   ├── tools.py                            # Calculator tool functions (add, subtract, multiply, divide, escalate)
-│   ├── palindrome_tools.py                 # Palindrome tool functions
-│   └── manifest/
-│       ├── calculator_agent_manifest.yaml  # Calculator agent — local function tools
-│       ├── palindrome_agent_manifest.yaml  # Palindrome agent — local function tools
-│       ├── calculator_mcp_manifest.yaml    # Calculator agent — MCP server tools
-│       └── palindrome_mcp_manifest.yaml    # Palindrome agent — MCP server tools
-│
-├── mcp_servers/
-│   ├── __init__.py
-│   ├── calculator_server.py                # FastMCP server wrapping tools.py (port 8001)
-│   └── palindrome_server.py                # FastMCP server wrapping palindrome_tools.py (port 8002)
-│
+├── .env                                          # Secrets — never committed
+├── .env.example                                  # Template — copy to .env and fill in
 ├── requirements.txt
-└── README.md
+├── commands.txt                                  # Quick command reference
+├── README.md
+│
+└── orchestrator/
+    ├── __init__.py                               # Lazy root_agent export for `adk web`
+    ├── agent.py                                  # ADK web entry point — builds root_agent
+    ├── agent_from_manifest.py                    # Core pipeline: load → validate → merge → build
+    ├── config.py                                 # Env-var layer — Settings dataclass singleton
+    ├── orchestrator.py                           # Orchestrator mode entry (ORCHESTRATOR_MODE=true)
+    │
+    ├── manifest/
+    │   ├── incident_agent_manifest.yaml          # IGA incident agent definition
+    │   └── orchestrator_manifest.yaml            # Orchestrator definition (sub-agent routing)
+    │
+    └── incident_agent/
+        ├── tools.py                              # 5 ADK tool wrappers with guardrail checks
+        ├── bigquery_tool.py                      # BigQuery data layer (ADC auth, lazy client)
+        ├── pii_redactor.py                       # after_model + after_tool PII callbacks
+        └── llm_policy_guardrail.py               # LLM-based tool call validation
 ```
 
 ---
 
-## The Three Layers
+## How It Works — Startup Pipeline
+
+Every time the agent starts, it runs this pipeline before accepting any request:
+
+```
+.env  +  manifest.yaml
+         │
+         ▼
+      config.py
+      Reads all env vars at boot → frozen Settings dataclass singleton.
+      Nothing re-reads .env after this point.
+         │
+         ▼
+  agent_from_manifest.py
+         │
+         ├─ load_manifest()
+         │    Reads the YAML file from MANIFEST_PATH.
+         │    Fails fast if file not found.
+         │
+         ├─ validate_manifest()
+         │    Checks required keys (identity, instruction, model, capabilities, policy).
+         │    Verifies tool_ids exist in TOOL_REGISTRY.
+         │    Checks sub-agent manifest_paths are readable.
+         │    Warns on non-blocking issues (missing version, unused tools).
+         │    Raises on fatal issues — agent will not start broken.
+         │
+         ├─ merge_config()
+         │    Resolves three-layer hierarchy:
+         │    ENV VAR  wins  →  YAML value  wins  →  hardcoded default
+         │    Builds MergedConfig with all resolved values.
+         │    Dynamically imports and instantiates callback factories.
+         │    Constructs MCPToolset / AgentTool / function references.
+         │
+         └─ build_agent()
+              Constructs ADK Agent with:
+                - resolved model name + inference params
+                - resolved tool list
+                - resolved system instruction
+                - resolved callbacks (after_model, after_tool)
+              Returns root_agent — ready to serve.
+```
+
+---
+
+## How It Works — Request Lifecycle
+
+What happens from the moment a user sends a message to when they get a response:
+
+```
+User sends message
+        │
+        ▼
+┌───────────────────────────────────────────────┐
+│  ORCHESTRATOR_MODE=true?                      │
+│  Yes → Orchestrator LLM receives message      │
+│         Orchestrator MUST call incident_agent  │
+│         (never answers directly)              │
+│  No  → Incident Agent receives directly       │
+└───────────────────────────┬───────────────────┘
+                            │
+                            ▼
+              Incident Agent LLM selects tool
+              (fetch_incidents_by_date,
+               build_triage_dashboard,
+               fetch_ai_analysis, etc.)
+                            │
+                            ▼
+              tools.py: _guard_or_block()
+              Calls LLM Policy Guardrail before execution
+                            │
+                    ┌───────┴────────┐
+                 BLOCKED          ALLOWED
+                    │                │
+               Return error          ▼
+                         bigquery_tool.*()
+                         → BigQuery JOIN:
+                           raw_incidents + analysis_result
+                         → Returns structured dict
+                            │
+                            ▼
+              after_tool_callback (pii_redactor.py)
+              Captures caller / assigned_to / resolved_by
+              into session state for later redaction
+                            │
+                            ▼
+              Incident Agent LLM formats response
+              (Markdown dashboard table / investigation report)
+                            │
+                            ▼
+              after_model_callback (pii_redactor.py)
+              Calls Gemini to scan output text
+              Replaces all person names → [NAME REDACTED]
+                            │
+                            ▼
+                   Final response → User
+```
+
+---
+
+## The Three Config Layers
 
 Resolution order: **Env Var > YAML manifest > hardcoded default**
 
-### Layer 1 — `.env` → `config.py`
+### Layer 1 — Environment Variables → `config.py`
 
-Reads environment variables at startup and locks them into frozen dataclasses. Nothing re-reads `.env` after boot. The `settings` object is a singleton available everywhere.
+All env vars are read once at startup and locked into a frozen `Settings` dataclass. The singleton is available everywhere as `settings`.
 
 ```
-AGENT_MODEL_NAME=gemini-2.5-flash  →  settings.agent.model_name
-MANIFEST_PATH=...                  →  settings.manifest.manifest_path
-CONFIDENCE_THRESHOLD=0.8           →  settings.policy.confidence_threshold
+GOOGLE_API_KEY            →  Gemini authentication
+ORCHESTRATOR_MODE         →  which agent is the root
+MANIFEST_PATH             →  which YAML to load
+AGENT_MODEL_NAME          →  settings.agent.model_name
+CONFIDENCE_THRESHOLD      →  settings.policy.confidence_threshold
+BQ_PROJECT                →  BigQuery GCP project
+GUARDRAIL_FAIL_CLOSED     →  guardrail block-on-error behavior
 ```
 
 ### Layer 2 — `manifest.yaml`
 
-The manifest is the single source of truth for what an agent is and how it behaves. It defines the system prompt, model, tools, policy, rate limits, and lifecycle — all in one file.
+The YAML manifest is the single source of truth for what an agent *is*:
+- **Identity** — name, version, owner, description
+- **Instruction** — full system prompt
+- **Model** — base model, temperature, max tokens
+- **Capabilities** — tools list (functions / sub-agents / MCP servers) + callbacks
+- **Policy** — allowed/denied problem types, rate limits, escalation config
+- **Observability** — logging, metrics, alerts
+- **Deployment** — target environments, lifecycle limits, canary config
 
-### Layer 3 — `merge_config()`
+### Layer 3 — `merge_config()` in `agent_from_manifest.py`
 
-Merges both layers into a single typed `MergedConfig` object. Env vars win. YAML fills the rest. This resolved config is what the agent is built from.
+Merges both layers into a single typed `MergedConfig` object. Env vars win at every field. YAML fills the gaps. Hardcoded defaults are last resort. The resolved config is what the ADK `Agent` is built from.
 
 ---
 
 ## Running Modes
 
-### Local Mode
+### Mode 1 — Single Agent (default)
 
-Tools run as Python functions inside the same process. No servers needed. Good for development.
-
-**Prerequisites**
-
-Copy `.env.example` to `.env` and add your API key:
+`ORCHESTRATOR_MODE=false` (or unset). The incident agent is loaded directly as the root agent.
 
 ```
-GOOGLE_API_KEY=your_gemini_api_key_here
-GOOGLE_GENAI_USE_VERTEXAI=FALSE
+User  →  IGA Incident Agent  →  BigQuery  →  Response
 ```
 
-**ADK Web UI**
+**1. Prerequisites**
 
 ```bash
+# Clone and install
 pip install -r requirements.txt
-adk web . --port 8000 # or just adk web
+
+# Configure secrets
+cp .env.example .env
+# Edit .env — set GOOGLE_API_KEY and BigQuery credentials
 ```
 
-Open `http://localhost:8000`, select `calculator_agent` from the dropdown.
-
-To run the palindrome agent in the web UI:
+**2. Authenticate with GCP** (for BigQuery access)
 
 ```bash
-MANIFEST_PATH=calculator_agent/manifest/palindrome_agent_manifest.yaml adk web . --port 8000
+gcloud auth application-default login
 ```
 
-**Terminal REPL**
+**3. Start the agent**
 
 ```bash
-# Calculator agent
-python -m calculator_agent.agent_from_manifest
+# ADK Web UI (browser) — default port 8000
+adk web .
 
-# Palindrome agent
-MANIFEST_PATH=calculator_agent/manifest/palindrome_agent_manifest.yaml \
-  python -m calculator_agent.agent_from_manifest
+# ADK Web UI — explicit manifest path
+MANIFEST_PATH=orchestrator/manifest/incident_agent_manifest.yaml adk web .
+
+# Terminal REPL
+python -m orchestrator.agent
 ```
+
+Open `http://localhost:8000` and select `incident_agent` from the dropdown.
 
 ---
 
-### MCP Mode
+### Mode 2 — Orchestrator Mode
 
-Tools run as standalone HTTP servers using the [Model Context Protocol](https://modelcontextprotocol.io). The agent connects to them over HTTP at runtime. This is the enterprise path — tools are decoupled from the agent process.
+`ORCHESTRATOR_MODE=true`. The orchestrator wraps the incident agent as a sub-agent tool via `AgentTool`. Routing is completely invisible to the user.
 
-**Step 1 — Start the MCP servers**
+```
+User  →  Orchestrator  →  incident_agent (AgentTool)  →  BigQuery  →  Response
+```
+
+The orchestrator's system prompt enforces: *"You MUST call incident_agent for every request. NEVER answer yourself."*
 
 ```bash
-# Terminal 1
-python -m mcp_servers.calculator_server
-# → Starting Calculator MCP Server on port 8001 at /mcp ...
+# ADK Web UI
+ORCHESTRATOR_MODE=true adk web .
 
-# Terminal 2
-python -m mcp_servers.palindrome_server
-# → Starting Palindrome MCP Server on port 8002 at /mcp ...
+# .env alternative (set once, no inline override needed)
+# ORCHESTRATOR_MODE=true
+# adk web .
 ```
 
-**Step 2 — Run the agent pointing at an MCP manifest**
+**When to use orchestrator mode:**
+- When you plan to add more specialist sub-agents in future
+- When you want a single routing layer that scales to multiple domains
+- When you need centralized policy at the routing level
 
-```bash
-# Terminal 3 — ADK web
-MANIFEST_PATH=calculator_agent/manifest/calculator_mcp_manifest.yaml adk web . --port 8000
+---
 
-# or terminal REPL
-MANIFEST_PATH=calculator_agent/manifest/calculator_mcp_manifest.yaml \
-  python -m calculator_agent.agent_from_manifest
+## Security & Guardrails
+
+Every response passes through four independent defense layers in sequence.
+
+```
+Request
+   │
+   ▼
+Layer 1 — Policy Enforcement (agent_from_manifest.py)
+   Checks denied_problem_types from manifest/env.
+   Blocks before Gemini ever sees the message.
+   │
+   ▼
+Layer 2 — LLM Policy Guardrail (llm_policy_guardrail.py)
+   Fires before every tool call.
+   Gemini evaluates: "Is this a legitimate incident lookup or prompt injection?"
+   Returns (allow: bool, reason: str).
+   GUARDRAIL_FAIL_CLOSED=1 → block on any evaluation error (default, safe).
+   GUARDRAIL_FAIL_CLOSED=0 → allow on error (open, use only in dev).
+   │
+   ▼
+Layer 3 — PII Capture (pii_redactor.py — after_tool_callback)
+   Intercepts every tool response before the LLM sees it.
+   Extracts caller, assigned_to, resolved_by fields.
+   Stores them in session state under _pii_* keys for use in Layer 4.
+   │
+   ▼
+Layer 4 — PII Redaction (pii_redactor.py — after_model_callback)
+   Intercepts the LLM's final output before it reaches the user.
+   Uses known_names from session state + fresh LLM scan.
+   Replaces every person name, email, and username with [NAME REDACTED].
+   Returns redacted LlmResponse. Original text never reaches the user.
 ```
 
-**How MCP tool loading works**
+| Layer | File | Trigger | Action on violation |
+|---|---|---|---|
+| Policy enforcement | `agent_from_manifest.py` | Every request | Reject with reason |
+| LLM policy guardrail | `llm_policy_guardrail.py` | Before every tool call | Block tool execution |
+| PII capture | `pii_redactor.py` | After every tool call | Store in session state |
+| PII redaction | `pii_redactor.py` | After every model response | Rewrite output |
 
-The manifest declares a URL instead of a function name:
+---
 
-```yaml
-- tool_id: "calculator_mcp"
-  type: "mcp_server"
-  url: "http://localhost:8001/mcp"
-  allowed_tool_ids: ["add", "subtract", "multiply", "divide"]
-  on_unavailable: "warn"
-  fallback_tool_id: "add"
-```
+## BigQuery Data Layer
+
+Authentication uses **GCP Application Default Credentials (ADC)** — no service account key files in code. The BigQuery client is a lazy singleton created on first tool call.
+
+### Configuration
+
+| Env Var | Default | Description |
+|---|---|---|
+| `BQ_PROJECT` | `gsk-corp-ai-tech-ops-dev` | GCP project ID |
+| `BQ_DATASET` | `snow` | Dataset name |
+| `BQ_RAW_TABLE` | `raw_incidents` | Source incidents from ServiceNow |
+| `BQ_RESULT_TABLE` | `analysis_result` | AI pipeline classification results |
+
+### Tables
+
+**`raw_incidents`** — Source incidents ingested from ServiceNow/monitoring:
+
+| Column | Description |
+|---|---|
+| `number` | Incident ID (e.g. INC0012345) |
+| `caller` | Person who raised the incident |
+| `short_description` | One-line summary |
+| `description` | Full incident description |
+| `category` | Incident category |
+| `priority` | P1 / P2 / P3 / P4 |
+| `state` | Current state |
+| `assignment_group` | Team assigned |
+| `assigned_to` | Individual assignee |
+| `opened_at` | Timestamp opened |
+| `closed_at` | Timestamp closed |
+| `ingested_at` | Pipeline ingestion timestamp |
+
+**`analysis_result`** — AI pipeline classifications (joined to raw_incidents on `number`):
+
+| Column | Description |
+|---|---|
+| `incident_type` | `NOISE` / `KB FOUND` / `RCA REQUIRED` |
+| `confidence_score` | Model confidence 0–1 |
+| `ai_analysis` | Full AI analysis text |
+| `summary` | Short summary |
+| `recommended_actions` | Suggested next steps |
+| `kb_article_title` | KB article name (KB FOUND only) |
+| `kb_article_url` | KB article URL (KB FOUND only) |
+| `rca_reason` | Why RCA is needed (RCA REQUIRED only) |
+| `noise_reason` | Why classified as noise (NOISE only) |
+| `lookalike_incidents` | Similar past incident IDs |
+
+### Incident Classification
+
+| Type | Meaning | Recommended Action |
+|---|---|---|
+| `NOISE` | Automated / non-actionable alert | Close without investigation |
+| `KB FOUND` | Known issue — matching KB article exists | Follow KB article steps |
+| `RCA REQUIRED` | Unknown issue — no KB match found | Perform root cause analysis |
+
+### Available Tools
+
+| Tool | Description |
+|---|---|
+| `fetch_ai_analysis` | Fetch AI classification and analysis for a single incident ID |
+| `fetch_incident_details` | Fetch full raw incident record by incident ID |
+| `fetch_incidents_by_date` | Date-range query with optional incident type filter, joins both tables |
+| `build_triage_dashboard` | Aggregated triage summary with classification counts and effort saved |
+| `list_columns` | Return available column names from raw_incidents |
+
+---
 
 ## Adding a New Agent
 
-No Python code needed. Three steps:
+**Drop one YAML file. That's it.**
 
-**1. Write a manifest**
+The orchestrator auto-discovers every `*_manifest.yaml` in `orchestrator/manifest/` at startup (except `orchestrator_manifest.yaml` itself). No other file needs to change — not the orchestrator manifest, not any Python code.
+
+### Step 1 — Write your agent manifest
+
+Drop it in `orchestrator/manifest/my_agent_manifest.yaml`:
 
 ```yaml
 identity:
   agent_id: "my_agent_001"
   name: "my_agent"
   display_name: "My Agent"
-  description: "Does something useful."
+  description: "Handles X, Y, and Z domain queries."   # ← drives routing
+  version: "1.0.0"
+  status: "active"
 
 instruction: |
   You are a helpful agent that ...
+  [your full system prompt here]
 
 model:
   base_model_id: "gemini-2.5-flash"
+  inference:
+    temperature: 0.1
+    max_output_tokens: 4096
 
 capabilities:
   tools:
-    - tool_id: "some_mcp_server"
+    - tool_id: "my_mcp_tool"
       type: "mcp_server"
       url: "http://localhost:9000/mcp"
       on_unavailable: "warn"
-      allowed: true
 
 policy:
-  denied_problem_types:
-    - "off_topic_requests"
+  confidence_threshold: 0.7
+  denied_problem_types: []
   rate_limits:
     requests_per_minute: 30
     max_concurrent_sessions: 5
+
+deployment:
+  lifecycle:
+    max_turns: 20
+    session_timeout_seconds: 300
 ```
 
-**2. Point `MANIFEST_PATH` at it**
+### Step 2 — Restart the orchestrator
 
 ```bash
-MANIFEST_PATH=calculator_agent/manifest/my_agent_manifest.yaml \
-  python -m calculator_agent.agent_from_manifest
+ORCHESTRATOR_MODE=true adk web .
 ```
 
-**3. That's it**
+On startup you will see:
+```
+  Orchestrator mode — auto-discovering specialist agents...
+  Found 2 specialist agent(s) in orchestrator/manifest/
 
-The control plane reads the manifest, validates it, enforces policy, and builds the agent automatically.
+  Discovered agent: incident_agent (incident_agent_manifest.yaml)
+  Discovered agent: my_agent (my_agent_manifest.yaml)
+```
 
-> If your agent uses local Python tools (not MCP), add the function to `tools.py` and register it in `TOOL_REGISTRY` in `agent_from_manifest.py`. For MCP tools, no code changes are needed at all.
+### Step 3 — Done
+
+The orchestrator reads `identity.description` from your manifest and automatically builds its routing instruction to include your new agent. The LLM now knows when to call it.
+
+> **The `identity.description` field drives routing.** Write it as a clear statement of what domain or queries the agent handles — this is what the orchestrator LLM reads to decide which agent to call for a given user request.
+
+### For local Python function tools
+
+If your agent uses `type: "function"` tools instead of MCP, add the Python callable to `TOOL_REGISTRY` in `agent_from_manifest.py` — one dict entry. MCP-based agents require zero Python changes.
 
 ---
 
 ## Manifest Reference
 
-| Section | Field | What it controls |
+### `identity`
+
+| Field | Required | Description |
 |---|---|---|
-| `identity` | `name`, `display_name` | Agent identity shown in ADK web |
-| `instruction` | _(string)_ | System prompt — agent persona and rules |
-| `model` | `base_model_id` | Gemini model to use |
-| `capabilities.tools` | `tool_id`, `type`, `url` | Which tools the agent can call |
-| `capabilities.tools` | `allowed_tool_ids` | Whitelist of tools exposed by an MCP server |
-| `capabilities.tools` | `on_unavailable` | `fail` = crash at startup / `warn` = skip with fallback |
-| `capabilities.tools` | `fallback_tool_id` | Local function to use if MCP server is unreachable |
-| `capabilities.tools` | `auth.type` + `auth.secret_ref` | MCP auth — credential read from env var |
-| `policy` | `denied_problem_types` | Requests blocked before Gemini sees them |
-| `policy` | `confidence_threshold` | When to trigger escalation |
-| `policy.rate_limits` | `requests_per_minute` | RPM cap (stub — wire to counter service in prod) |
-| `deployment.lifecycle` | `max_turns`, `session_timeout_seconds` | Session limits |
+| `agent_id` | Yes | Unique identifier string |
+| `name` | Yes | Module-style name used by ADK |
+| `display_name` | Yes | Human-readable name shown in UI |
+| `description` | Yes | Purpose description |
+| `version` | No | Semver string |
+| `status` | No | `active` / `deprecated` / `experimental` |
 
-### Tool types
+### `instruction`
 
-| `type` | Behaviour |
+Full system prompt as a YAML block scalar. Supports `|` (literal, preserves newlines) or `>` (folded). This is what Gemini receives as its system instruction.
+
+### `model`
+
+| Field | Description |
 |---|---|
-| `function` | Local Python function — looked up in `TOOL_REGISTRY` |
-| `human_in_loop` | Local Python function — same as `function`, signals human review intent |
-| `mcp_server` | Remote HTTP server — connected via `MCPToolset` at first tool call |
+| `base_model_id` | Gemini model string (e.g. `gemini-2.5-flash`) |
+| `inference.temperature` | Sampling temperature |
+| `inference.max_output_tokens` | Max tokens in response |
+| `inference.top_p` | Nucleus sampling parameter |
 
-### MCP auth types
+### `capabilities.tools`
 
-| `auth.type` | Header sent |
+| Field | Description |
 |---|---|
-| `none` | No auth header |
-| `api_key` | `X-API-Key: <value of secret_ref env var>` |
-| `bearer` | `Authorization: Bearer <value of secret_ref env var>` |
+| `tool_id` | Identifier — must match TOOL_REGISTRY key for `function` type |
+| `type` | `function` / `sub_agent` / `mcp_server` / `human_in_loop` |
+| `allowed` | `true` / `false` — whether tool is active |
+| `manifest_path` | Path to sub-agent manifest (sub_agent type only) |
+| `url` | HTTP endpoint (mcp_server type only) |
+| `allowed_tool_ids` | Whitelist of tool names exposed by MCP server |
+| `on_unavailable` | `fail` = crash at startup / `warn` = skip with fallback |
+| `fallback_tool_id` | Local function to use if MCP server is unreachable |
+| `auth.type` | `none` / `api_key` / `bearer` |
+| `auth.secret_ref` | Name of env var holding the credential value |
 
-Credentials are never stored in the manifest. `secret_ref` is just the name of the env var to read.
+### `capabilities.callbacks`
+
+| Field | Description |
+|---|---|
+| `after_model_callback` | `module.path:factory_function` — called after every LLM response |
+| `after_tool_callback` | `module.path:factory_function` — called after every tool execution |
+
+Callbacks are resolved dynamically at build time via `importlib`. The factory is called once; the returned function is registered as the callback.
+
+### `policy`
+
+| Field | Description |
+|---|---|
+| `confidence_threshold` | Float 0–1 — minimum confidence to act without escalation |
+| `allowed_problem_types` | List of problem type strings that are permitted |
+| `denied_problem_types` | List of problem type strings that are blocked pre-LLM |
+| `rate_limits.requests_per_minute` | RPM cap |
+| `rate_limits.max_concurrent_sessions` | Concurrent session cap |
+| `escalation.enabled` | Whether human escalation is enabled |
+
+### `deployment.lifecycle`
+
+| Field | Description |
+|---|---|
+| `max_turns` | Maximum turns per session |
+| `session_timeout_seconds` | Idle session timeout |
+| `graceful_shutdown_seconds` | Shutdown grace period |
 
 ---
 
-## Env Var Overrides
+## Environment Variable Reference
 
-Any YAML value can be overridden at runtime without touching any files.
+All YAML values can be overridden at runtime via env vars. Inline overrides (`KEY=value adk web .`) take effect immediately without editing any file.
 
-| Env Var | Overrides |
-|---|---|
-| `MANIFEST_PATH` | Path to the YAML manifest |
-| `AGENT_MODEL_NAME` | `model.base_model_id` |
-| `CONFIDENCE_THRESHOLD` | `policy.confidence_threshold` |
-| `ALLOWED_PROBLEM_TYPES` | `policy.allowed_problem_types` (comma-separated) |
-| `DENIED_PROBLEM_TYPES` | `policy.denied_problem_types` (comma-separated) |
-| `RATE_LIMIT_RPM` | `policy.rate_limits.requests_per_minute` |
-| `MAX_CONCURRENT_SESSIONS` | `policy.rate_limits.max_concurrent_sessions` |
-| `MAX_TURNS` | `deployment.lifecycle.max_turns` |
-| `SESSION_TIMEOUT` | `deployment.lifecycle.session_timeout_seconds` |
-| `CALCULATOR_MCP_PORT` | Port for calculator MCP server (default: 8001) |
-| `PALINDROME_MCP_PORT` | Port for palindrome MCP server (default: 8002) |
+### Core
 
----
-
-## MCP Fallback Behaviour
-
-When an MCP server is unreachable at startup, `_load_tools()` follows this decision tree:
-
-```
-MCPToolset construction fails
-        ↓
-on_unavailable: "fail"   →  RuntimeError — agent does not start
-on_unavailable: "warn"   →  check fallback_tool_id
-                                 found in TOOL_REGISTRY  →  load local function
-                                                             print [FALLBACK] message
-                                 not found               →  skip tool entirely
-                                                             print [WARN] message
-```
-
-Startup output when fallback triggers:
-
-```
-[WARN] MCP toolset 'calculator_mcp' failed to load: Connection refused
-[FALLBACK] calculator_mcp unreachable → using local 'add' function
-```
-
-> Note: Fallback only applies at startup. If an MCP server goes down mid-session after the agent is already running, that is an infrastructure-level concern (health checks, retries) outside the scope of this control plane.
-
----
-
-## Available Agents
-
-| Manifest | Mode | Tools |
+| Variable | Default | Description |
 |---|---|---|
-| `calculator_agent_manifest.yaml` | Local functions | add, subtract, multiply, divide, escalate |
-| `palindrome_agent_manifest.yaml` | Local functions | is_palindrome, longest_palindrome_substring, make_palindrome, palindrome_score, escalate |
-| `calculator_mcp_manifest.yaml` | MCP server (port 8001) | same calculator tools, served over HTTP |
-| `palindrome_mcp_manifest.yaml` | MCP server (port 8002) | same palindrome tools, served over HTTP |
+| `GOOGLE_API_KEY` | — | Gemini API key (required if not using Vertex AI) |
+| `GOOGLE_GENAI_USE_VERTEXAI` | `FALSE` | Set `TRUE` to use Vertex AI instead of AI Studio |
+| `ORCHESTRATOR_MODE` | `false` | `true` = load orchestrator as root agent |
+| `MANIFEST_PATH` | `orchestrator/manifest/incident_agent_manifest.yaml` | Path to agent manifest |
+| `RUN_MODE` | `ui` | `ui` = ADK web / `terminal` = REPL |
 
-Switch between agents by changing `MANIFEST_PATH`. No restarts needed for the MCP servers.
+### Agent & Model
+
+| Variable | Overrides | Description |
+|---|---|---|
+| `AGENT_MODEL_NAME` | `model.base_model_id` | Gemini model to use |
+| `MAX_TURNS` | `deployment.lifecycle.max_turns` | Max turns per session |
+| `SESSION_TIMEOUT` | `deployment.lifecycle.session_timeout_seconds` | Idle timeout in seconds |
+
+### Policy
+
+| Variable | Overrides | Description |
+|---|---|---|
+| `CONFIDENCE_THRESHOLD` | `policy.confidence_threshold` | Min confidence threshold |
+| `ALLOWED_PROBLEM_TYPES` | `policy.allowed_problem_types` | Comma-separated list |
+| `DENIED_PROBLEM_TYPES` | `policy.denied_problem_types` | Comma-separated list |
+| `RATE_LIMIT_RPM` | `policy.rate_limits.requests_per_minute` | Requests per minute cap |
+| `MAX_CONCURRENT_SESSIONS` | `policy.rate_limits.max_concurrent_sessions` | Session concurrency cap |
+
+### BigQuery
+
+| Variable | Default | Description |
+|---|---|---|
+| `BQ_PROJECT` | `gsk-corp-ai-tech-ops-dev` | GCP project ID |
+| `BQ_DATASET` | `snow` | BigQuery dataset name |
+| `BQ_RAW_TABLE` | `raw_incidents` | Source incidents table |
+| `BQ_RESULT_TABLE` | `analysis_result` | AI results table |
+
+### Guardrail
+
+| Variable | Default | Description |
+|---|---|---|
+| `ENABLE_LLM_POLICY_GUARDRAIL` | `1` | `0` to disable guardrail entirely |
+| `GUARDRAIL_MODEL` | `gemini-2.5-flash` | Model used for guardrail evaluation |
+| `GUARDRAIL_FAIL_CLOSED` | `1` | `1` = block on error (safe) / `0` = allow on error |

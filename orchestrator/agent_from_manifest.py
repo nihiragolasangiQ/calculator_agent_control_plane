@@ -1,156 +1,115 @@
-# orchestrator/agent_from_manifest.py
-
 import asyncio
+import importlib
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
 from google.adk.agents import Agent
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
-from google.adk.tools.mcp_tool import MCPToolset
-from google.adk.tools.mcp_tool import StreamableHTTPConnectionParams
+from google.adk.tools.mcp_tool import MCPToolset, StreamableHTTPConnectionParams, StdioConnectionParams
 from google.adk.tools.agent_tool import AgentTool
 from google.genai.types import Content, Part
+from mcp import StdioServerParameters
 
 from .config import settings
-from .calculator_agent.tools import add, subtract, multiply, divide, escalate
-from .palindrome_agent.tools import (
-    is_palindrome,
-    longest_palindrome_substring,
-    make_palindrome,
-    palindrome_score,
+from .incident_agent.tools import (
+    fetch_ai_analysis,
+    fetch_incident_details,
+    list_columns,
+    build_triage_dashboard,
+    fetch_incidents_by_date,
 )
 
-
-# ---------------------------------------------------------------------------
-# TOOL REGISTRY
-# Maps tool_id strings (from manifest) → Python callables.
-# Used for type: function and type: human_in_loop tools.
-# For type: mcp_server tools, McpToolset is constructed directly from the
-# manifest URL — no entry in this registry is needed.
-# ---------------------------------------------------------------------------
-
 TOOL_REGISTRY = {
-    # Calculator tools
-    "add": add,
-    "subtract": subtract,
-    "multiply": multiply,
-    "divide": divide,
-    # Palindrome tools
-    "is_palindrome": is_palindrome,
-    "longest_palindrome_substring": longest_palindrome_substring,
-    "make_palindrome": make_palindrome,
-    "palindrome_score": palindrome_score,
-    # Shared
-    "escalate": escalate,
+    "fetch_ai_analysis": fetch_ai_analysis,
+    "fetch_incident_details": fetch_incident_details,
+    "list_columns": list_columns,
+    "build_triage_dashboard": build_triage_dashboard,
+    "fetch_incidents_by_date": fetch_incidents_by_date,
 }
 
 
-# ---------------------------------------------------------------------------
-# MERGED CONFIG
-# Holds the final resolved values after env-var layer and YAML layer are
-# combined.  Env var wins → YAML wins → hardcoded default.
-# ---------------------------------------------------------------------------
-
 @dataclass
 class MergedConfig:
-    """Resolved runtime config: env-var layer merged with YAML layer."""
-    # identity
     agent_id: str
     name: str
     display_name: str
     description: str
-    # instruction (system prompt — lives in YAML, not code)
     instruction: str
-    # model
     model_name: str
-    # policy
     confidence_threshold: float
     allowed_problem_types: tuple[str, ...]
     denied_problem_types: tuple[str, ...]
-    # rate limits
     requests_per_minute: int
     max_concurrent_sessions: int
-    # lifecycle
     max_turns: int
     session_timeout: int
-    # tools (resolved callables or McpToolset objects)
     tools: list
-    # sub_agents (ADK Agent objects — populated for orchestrator manifests)
     sub_agents: list
+    after_model_callback: object = None
+    after_tool_callback: object = None
 
-
-# ---------------------------------------------------------------------------
-# STEP 1 — MANIFEST LOADER
-# Reads YAML from the path resolved by config.py (env var > default).
-# ---------------------------------------------------------------------------
 
 def load_manifest() -> dict:
     path: Path = settings.manifest.manifest_path
     if not path.exists():
         raise FileNotFoundError(f"Manifest not found at: {path}")
-
-    with open(path, "r") as f:
+    with open(path) as f:
         manifest = yaml.safe_load(f)
-
     print(f"  Manifest loaded : {manifest['identity']['display_name']} v{manifest['identity']['version']}")
     return manifest
 
 
-# ---------------------------------------------------------------------------
-# STEP 1b — MANIFEST VALIDATOR
-# Structural validation at startup — before any agent construction.
-# Catches config errors early rather than at first user request.
-# Does NOT make network calls (MCP server reachability is a runtime concern).
-# ---------------------------------------------------------------------------
-
 def validate_manifest(manifest: dict) -> None:
-    """Validates manifest structure. Raises ValueError on hard errors, prints WARNs."""
     print("\n  Validating manifest...")
 
-    # Required top-level keys
-    required_keys = ["identity", "instruction", "model", "capabilities", "policy"]
-    for key in required_keys:
+    for key in ["identity", "instruction", "model", "capabilities", "policy"]:
         if key not in manifest:
             raise ValueError(f"Manifest validation FAILED: missing required key '{key}'")
 
     errors = []
     warnings = []
-
     tools = manifest.get("capabilities", {}).get("tools", [])
+
     for tool in tools:
         tool_id   = tool.get("tool_id", "<unknown>")
         tool_type = tool.get("type", "function")
         allowed   = tool.get("allowed", False)
-        version   = tool.get("version")
 
         if not allowed:
             print(f"    [SKIP] {tool_id} (allowed: false)")
             continue
 
-        if version is None:
+        if tool.get("version") is None:
             warnings.append(f"{tool_id}: no 'version' field (informational)")
 
         if tool_type == "mcp_server":
-            url = tool.get("url", "").strip()
-            if not url:
-                errors.append(f"{tool_id}: type=mcp_server but 'url' is missing or empty")
+            transport = tool.get("transport", "http").strip().lower()
+            if transport == "stdio":
+                command = tool.get("command", "").strip()
+                if not command:
+                    errors.append(f"{tool_id}: transport=stdio but 'command' is missing or empty")
+                else:
+                    args = tool.get("args", [])
+                    print(f"    [PASS] {tool_id} (mcp_server/stdio → {command} {' '.join(args)})")
             else:
-                print(f"    [PASS] {tool_id} (mcp_server → {url})")
+                url = tool.get("url", "").strip()
+                if not url:
+                    errors.append(f"{tool_id}: type=mcp_server but 'url' is missing or empty")
+                else:
+                    print(f"    [PASS] {tool_id} (mcp_server/http → {url})")
 
             fallback_id = tool.get("fallback_tool_id", "").strip()
             if fallback_id and fallback_id not in TOOL_REGISTRY:
                 warnings.append(
-                    f"{tool_id}: fallback_tool_id='{fallback_id}' not found in TOOL_REGISTRY — fallback will be skipped"
+                    f"{tool_id}: fallback_tool_id='{fallback_id}' not found in TOOL_REGISTRY"
                 )
 
         elif tool_type in ("function", "human_in_loop"):
             if tool_id not in TOOL_REGISTRY:
-                errors.append(
-                    f"{tool_id}: type={tool_type} but tool_id not found in TOOL_REGISTRY"
-                )
+                errors.append(f"{tool_id}: type={tool_type} but tool_id not found in TOOL_REGISTRY")
             else:
                 print(f"    [PASS] {tool_id} (function in TOOL_REGISTRY)")
 
@@ -167,12 +126,11 @@ def validate_manifest(manifest: dict) -> None:
                 else:
                     skills = tool.get("skills", [])
                     print(f"    [PASS] {tool_id} (sub_agent → {manifest_path}, skills={skills})")
-
         else:
             warnings.append(f"{tool_id}: unknown type '{tool_type}' — skipped validation")
 
     if not tools:
-        warnings.append("No tools declared — agent will run on model knowledge only (no tool calls possible)")
+        warnings.append("No tools declared — agent will run on model knowledge only")
 
     for w in warnings:
         print(f"    [WARN] {w}")
@@ -183,74 +141,55 @@ def validate_manifest(manifest: dict) -> None:
     print(f"  Manifest valid  : {len(tools)} tools checked, {len(warnings)} warnings\n")
 
 
-# ---------------------------------------------------------------------------
-# STEP 2 — CONFIG MERGER
-# Applies env-var layer on top of YAML values.
-# Resolution order: Env Var > YAML > hardcoded default
-# ---------------------------------------------------------------------------
-
 def merge_config(manifest: dict) -> MergedConfig:
-    """Merge settings (env layer) with manifest (YAML layer)."""
-
     yaml_policy      = manifest.get("policy", {})
     yaml_rate_limits = yaml_policy.get("rate_limits", {})
     yaml_lifecycle   = manifest.get("deployment", {}).get("lifecycle", {})
 
-    # --- model: env var wins, then YAML, then settings default ---
     model_name = (
         settings.agent.model_name
         if "AGENT_MODEL_NAME" in os.environ
         else manifest["model"]["base_model_id"]
     )
-
-    # --- policy: env var wins, then YAML, then settings default ---
     confidence_threshold = (
         settings.policy.confidence_threshold
         if "CONFIDENCE_THRESHOLD" in os.environ
         else float(yaml_policy.get("confidence_threshold", settings.policy.confidence_threshold))
     )
-
     allowed_problem_types = (
         settings.policy.allowed_problem_types
         if "ALLOWED_PROBLEM_TYPES" in os.environ
         else tuple(yaml_policy.get("allowed_problem_types", list(settings.policy.allowed_problem_types)))
     )
-
     denied_problem_types = (
         settings.policy.denied_problem_types
         if "DENIED_PROBLEM_TYPES" in os.environ
         else tuple(yaml_policy.get("denied_problem_types", list(settings.policy.denied_problem_types)))
     )
-
-    # --- rate limits: env var wins, then YAML, then settings default ---
     requests_per_minute = (
         settings.rate_limits.requests_per_minute
         if "RATE_LIMIT_RPM" in os.environ
         else int(yaml_rate_limits.get("requests_per_minute", settings.rate_limits.requests_per_minute))
     )
-
     max_concurrent_sessions = (
         settings.rate_limits.max_concurrent_sessions
         if "MAX_CONCURRENT_SESSIONS" in os.environ
         else int(yaml_rate_limits.get("max_concurrent_sessions", settings.rate_limits.max_concurrent_sessions))
     )
-
-    # --- lifecycle: env var wins, then YAML, then settings default ---
     max_turns = (
         settings.agent.max_turns
         if "MAX_TURNS" in os.environ
         else int(yaml_lifecycle.get("max_turns", settings.agent.max_turns))
     )
-
     session_timeout = (
         settings.agent.session_timeout
         if "SESSION_TIMEOUT" in os.environ
         else int(yaml_lifecycle.get("session_timeout_seconds", settings.agent.session_timeout))
     )
 
-    # --- tools and sub_agents: always resolved from manifest ---
-    tools = _load_tools(manifest)
+    tools      = _load_tools(manifest)
     sub_agents = _load_sub_agents(manifest)
+    after_model_cb, after_tool_cb = _resolve_callbacks(manifest)
 
     instruction = manifest.get("instruction", "").strip()
     if not instruction:
@@ -272,31 +211,19 @@ def merge_config(manifest: dict) -> MergedConfig:
         session_timeout=session_timeout,
         tools=tools,
         sub_agents=sub_agents,
+        after_model_callback=after_model_cb,
+        after_tool_callback=after_tool_cb,
     )
-
-    print(f"  Config merged   : model={merged.model_name} | "
-          f"rpm={merged.requests_per_minute} | "
-          f"max_turns={merged.max_turns} | "
-          f"confidence≥{merged.confidence_threshold}")
+    print(
+        f"  Config merged   : model={merged.model_name} | "
+        f"rpm={merged.requests_per_minute} | "
+        f"max_turns={merged.max_turns} | "
+        f"confidence≥{merged.confidence_threshold}"
+    )
     return merged
 
 
-# ---------------------------------------------------------------------------
-# AUTH HELPER (used by _load_tools for mcp_server tools)
-# Reads credentials from env vars — secrets never live in the manifest YAML.
-# ---------------------------------------------------------------------------
-
 def _resolve_auth_headers(auth_config: dict) -> dict:
-    """Resolves MCP auth credentials from env vars named in secret_ref.
-
-    Auth types:
-      none     → {} (no credential)
-      api_key  → {"X-API-Key": os.getenv(secret_ref)}
-      bearer   → {"Authorization": "Bearer " + os.getenv(secret_ref)}
-
-    The credential is read once at agent startup and baked into McpToolset.
-    If the credential rotates, restart the process.
-    """
     auth_type  = auth_config.get("type", "none")
     secret_ref = auth_config.get("secret_ref", "").strip()
 
@@ -309,77 +236,100 @@ def _resolve_auth_headers(auth_config: dict) -> dict:
 
     if auth_type == "api_key":
         return {"X-API-Key": credential}
-    elif auth_type == "bearer":
+    if auth_type == "bearer":
         return {"Authorization": f"Bearer {credential}"}
-
     return {}
 
 
-# ---------------------------------------------------------------------------
-# TOOL LOADER (internal helper used by merge_config)
-# Routes tool declarations to the correct loading path:
-#   type: mcp_server       → McpToolset (remote, URL-based)
-#   type: function         → TOOL_REGISTRY lookup (local Python callable)
-#   type: human_in_loop    → TOOL_REGISTRY lookup (local Python callable)
-# ---------------------------------------------------------------------------
+def _resolve_callbacks(manifest: dict) -> tuple:
+    callbacks      = manifest.get("capabilities", {}).get("callbacks", {})
+    after_model_cb = None
+    after_tool_cb  = None
+
+    for cb_key, target in [
+        ("after_model_callback", "after_model_cb"),
+        ("after_tool_callback",  "after_tool_cb"),
+    ]:
+        ref = callbacks.get(cb_key, "").strip()
+        if not ref:
+            continue
+        try:
+            module_path, factory_name = ref.rsplit(":", 1)
+            factory = getattr(importlib.import_module(module_path), factory_name)
+            cb = factory()
+            if cb_key == "after_model_callback":
+                after_model_cb = cb
+            else:
+                after_tool_cb = cb
+            print(f"    Callback loaded: {cb_key} → {ref}")
+        except Exception as exc:
+            print(f"    [WARN] Failed to load callback '{cb_key}' ({ref}): {exc}")
+
+    return after_model_cb, after_tool_cb
+
 
 def _load_tools(manifest: dict) -> list:
-    """Resolves tool declarations from the manifest into ADK tool objects.
-
-    McpToolset.__init__ is synchronous-safe — it only instantiates a
-    MCPSessionManager and stores connection params. No I/O happens here.
-    The actual async HTTP connection to the MCP server is deferred until
-    ADK calls get_tools() during the first agent invocation.
-
-    on_unavailable behaviour:
-      "fail" → raise RuntimeError if tool cannot be loaded
-      "warn" → log a warning and skip the tool (agent starts with partial tools)
-    """
     allowed_tools = []
 
     for tool in manifest["capabilities"]["tools"]:
-        tool_id          = tool["tool_id"]
-        tool_type        = tool.get("type", "function")
-        on_unavailable   = tool.get("on_unavailable", "fail")
+        tool_id        = tool["tool_id"]
+        tool_type      = tool.get("type", "function")
+        on_unavailable = tool.get("on_unavailable", "fail")
 
         if not tool["allowed"]:
             print(f"    Tool disabled: {tool_id}")
             continue
 
-        # ── MCP server path ──────────────────────────────────────────────────
         if tool_type == "mcp_server":
-            url              = tool.get("url", "").strip()
-            allowed_tool_ids = tool.get("allowed_tool_ids") or None  # None = allow all
-            auth_config      = tool.get("auth", {"type": "none", "secret_ref": ""})
+            transport        = tool.get("transport", "http").strip().lower()
+            allowed_tool_ids = tool.get("allowed_tool_ids") or None
             fallback_tool_id = tool.get("fallback_tool_id", "").strip() or None
 
             try:
-                headers = _resolve_auth_headers(auth_config)
-                toolset = MCPToolset(
-                    connection_params=StreamableHTTPConnectionParams(
+                if transport == "stdio":
+                    command  = tool.get("command", "").strip()
+                    args     = tool.get("args", [])
+                    tool_env = {k: os.path.expandvars(v) for k, v in tool.get("env", {}).items()}
+                    if not command:
+                        raise ValueError(f"{tool_id}: transport=stdio but 'command' is missing")
+                    connection_params = StdioConnectionParams(
+                        server_params=StdioServerParameters(
+                            command=command,
+                            args=args,
+                            env=tool_env if tool_env else None,
+                        )
+                    )
+                    filter_note = f"filter={allowed_tool_ids}" if allowed_tool_ids else "no filter"
+                    print(f"    Tool loaded  : {tool_id} (stdio → {command} {' '.join(args)}, {filter_note})")
+                else:
+                    url         = tool.get("url", "").strip()
+                    auth_config = tool.get("auth", {"type": "none", "secret_ref": ""})
+                    if not url:
+                        raise ValueError(f"{tool_id}: transport=http but 'url' is missing")
+                    headers = _resolve_auth_headers(auth_config)
+                    connection_params = StreamableHTTPConnectionParams(
                         url=url,
                         headers=headers if headers else None,
-                    ),
+                    )
+                    filter_note = f"filter={allowed_tool_ids}" if allowed_tool_ids else "no filter"
+                    print(f"    Tool loaded  : {tool_id} (http @ {url}, {filter_note})")
+
+                allowed_tools.append(MCPToolset(
+                    connection_params=connection_params,
                     tool_filter=allowed_tool_ids,
-                )
-                allowed_tools.append(toolset)
-                filter_note = f"filter={allowed_tool_ids}" if allowed_tool_ids else "no filter"
-                print(f"    Tool loaded  : {tool_id} (mcp_server @ {url}, {filter_note})")
+                ))
 
             except Exception as exc:
                 msg = f"MCP toolset '{tool_id}' failed to load: {exc}"
                 if on_unavailable == "fail":
                     raise RuntimeError(msg) from exc
-
-                # on_unavailable == "warn" — try local fallback before giving up
                 print(f"    [WARN] {msg}")
                 if fallback_tool_id and fallback_tool_id in TOOL_REGISTRY:
                     allowed_tools.append(TOOL_REGISTRY[fallback_tool_id])
-                    print(f"    [FALLBACK] {tool_id} unreachable → using local '{fallback_tool_id}' function")
+                    print(f"    [FALLBACK] {tool_id} unreachable → using local '{fallback_tool_id}'")
                 else:
                     print(f"    [WARN] No fallback for '{tool_id}' — tool unavailable this session")
 
-        # ── Function / human_in_loop path ────────────────────────────────────
         else:
             if tool_id in TOOL_REGISTRY:
                 allowed_tools.append(TOOL_REGISTRY[tool_id])
@@ -390,116 +340,78 @@ def _load_tools(manifest: dict) -> list:
     return allowed_tools
 
 
-# ---------------------------------------------------------------------------
-# SUB-AGENT LOADER (internal helper used by merge_config)
-# Handles type: sub_agent tools — builds full ADK Agent objects from their
-# own manifests. Each sub-agent is independent: own tools, own instruction,
-# own model. They have no awareness of the orchestrator or each other.
-# ---------------------------------------------------------------------------
-
 def _load_sub_agents(manifest: dict) -> list:
-    """Builds ADK Agent objects for every type: sub_agent tool declaration."""
     sub_agents = []
 
     for tool in manifest["capabilities"]["tools"]:
-        if not tool.get("allowed", False):
-            continue
-        if tool.get("type") != "sub_agent":
+        if not tool.get("allowed", False) or tool.get("type") != "sub_agent":
             continue
 
         tool_id       = tool["tool_id"]
         manifest_path = tool.get("manifest_path", "").strip()
 
-        # Resolve path relative to project root (3 levels up from manifest file)
         resolved = Path(manifest_path)
         if not resolved.is_absolute():
             resolved = Path(settings.manifest.manifest_path).parent.parent.parent / manifest_path
 
-        with open(resolved, "r") as f:
+        with open(resolved) as f:
             sub_manifest = yaml.safe_load(f)
 
         print(f"\n  Loading sub-agent: {tool_id}")
         validate_manifest(sub_manifest)
         sub_merged = merge_config(sub_manifest)
         sub_agent  = build_agent_from_manifest(sub_merged)
-        agent_tool = AgentTool(agent=sub_agent)
-        sub_agents.append(agent_tool)
+        sub_agents.append(AgentTool(agent=sub_agent))
         print(f"  Sub-agent ready : {tool_id} (AgentTool, skills={tool.get('skills', [])})")
 
     return sub_agents
 
 
-# ---------------------------------------------------------------------------
-# STEP 3 — POLICY ENFORCER
-# Validates every request against merged config before it reaches the agent.
-# Control plane responsibility — agent code knows nothing about this.
-# ---------------------------------------------------------------------------
-
 def enforce_policy(problem: str, merged: MergedConfig) -> dict:
     for denied in merged.denied_problem_types:
         if denied.lower() in problem.lower():
-            return {
-                "allowed": False,
-                "reason": f"Problem type '{denied}' is not allowed per policy.",
-            }
-
-    # Rate limits — stub; production wires this to a counter service
+            return {"allowed": False, "reason": f"Problem type '{denied}' is not allowed per policy."}
     print(f"  Rate limit check: {merged.requests_per_minute} rpm (not enforced locally)")
-
     return {"allowed": True, "reason": None}
 
-
-# ---------------------------------------------------------------------------
-# STEP 4 — AGENT BUILDER
-# Constructs the ADK Agent from merged config.
-# ---------------------------------------------------------------------------
 
 def build_agent_from_manifest(merged: MergedConfig) -> Agent:
     print(f"\n  Building agent  : {merged.display_name}")
 
-    all_tools = merged.tools + merged.sub_agents
-
-    agent = Agent(
+    all_tools   = merged.tools + merged.sub_agents
+    agent_kwargs = dict(
         name=merged.name,
         model=merged.model_name,
         description=merged.description,
         instruction=merged.instruction,
         tools=all_tools,
     )
+    if merged.after_model_callback:
+        agent_kwargs["after_model_callback"] = merged.after_model_callback
+        print("  Callback        : after_model_callback attached")
+    if merged.after_tool_callback:
+        agent_kwargs["after_tool_callback"] = merged.after_tool_callback
+        print("  Callback        : after_tool_callback attached")
 
+    agent = Agent(**agent_kwargs)
     print(f"  Model           : {merged.model_name}")
     print(f"  Tools           : {len(merged.tools)} function/mcp tools + {len(merged.sub_agents)} agent tools = {len(all_tools)} total")
     return agent
 
 
-# ---------------------------------------------------------------------------
-# ORCHESTRATOR
-# Load → Validate → Merge → Enforce policy → Build → Run
-# ---------------------------------------------------------------------------
-
 async def run_from_manifest(problem: str, merged: MergedConfig, agent: Agent):
     print(f"\n  Problem: {problem}")
-
     policy_result = enforce_policy(problem, merged)
     if not policy_result["allowed"]:
         print(f"  Blocked by policy: {policy_result['reason']}")
         return
 
     session_service = InMemorySessionService()
-    session = await session_service.create_session(
-        app_name=merged.name,
-        user_id="user_001",
-    )
-
-    runner = Runner(
-        agent=agent,
-        app_name=merged.name,
-        session_service=session_service,
-    )
-
+    session = await session_service.create_session(app_name=merged.name, user_id="user_001")
+    runner  = Runner(agent=agent, app_name=merged.name, session_service=session_service)
     message = Content(role="user", parts=[Part(text=problem)])
 
-    print(f"\n  Agent response:")
+    print("\n  Agent response:")
     async for event in runner.run_async(
         user_id="user_001",
         session_id=session.id,
@@ -509,32 +421,20 @@ async def run_from_manifest(problem: str, merged: MergedConfig, agent: Agent):
             print(event.content.parts[0].text)
 
 
-# ---------------------------------------------------------------------------
-# ENTRY POINT — terminal mode
-# Pipeline: load → validate → merge → build → REPL loop
-# The entire REPL runs inside a single asyncio.run() so MCPToolset
-# connections persist across questions (not torn down per-question).
-# ---------------------------------------------------------------------------
-
 async def _repl(merged: MergedConfig, agent: Agent):
     print(f"\n  {merged.display_name} (terminal mode)")
-    print("   Type your problem and press Enter")
-    print("   Type 'exit' to quit")
+    print("  Type your message and press Enter. Type 'exit' to quit.")
     print("-" * 50)
 
     while True:
         try:
             problem = input("\n> ").strip()
-
             if problem.lower() == "exit":
                 print("Bye!")
                 break
-
             if not problem:
                 continue
-
             await run_from_manifest(problem, merged, agent)
-
         except KeyboardInterrupt:
             print("\nBye!")
             break
@@ -542,10 +442,8 @@ async def _repl(merged: MergedConfig, agent: Agent):
 
 if __name__ == "__main__":
     print("\nInitializing Agent Control Plane...")
-
     manifest = load_manifest()
     validate_manifest(manifest)
-    merged = merge_config(manifest)
-    agent = build_agent_from_manifest(merged)
-
+    merged   = merge_config(manifest)
+    agent    = build_agent_from_manifest(merged)
     asyncio.run(_repl(merged, agent))

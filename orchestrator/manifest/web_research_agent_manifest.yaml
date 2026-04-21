@@ -1,0 +1,128 @@
+# =============================================================================
+# web_research_agent_manifest.yaml — Web Research Agent
+# Powered by Firecrawl MCP Server (stdio transport via npx)
+# Version schema: v1.0
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# IDENTITY
+# -----------------------------------------------------------------------------
+identity:
+  agent_id: "web_research_agent_001"
+  name: "web_research_agent"
+  display_name: "Web Research Agent"
+  description: >
+    Handles web research, URL scraping, structured data extraction from websites,
+    and web search queries. Use for any request that requires fetching live content
+    from the internet, crawling websites, or extracting structured information from URLs.
+  owner:
+    team: "quantum-team"
+    email: "quantum@company.com"
+  version: "1.0.0"
+  status: "active"
+
+
+# -----------------------------------------------------------------------------
+# INSTRUCTION
+# -----------------------------------------------------------------------------
+instruction: |
+  You are the Web Research Agent.
+  Your job is to help users research topics on the web, scrape URLs for content,
+  extract structured data from websites, and perform web searches.
+
+  ===== TOOLS AVAILABLE =====
+  You have access to Firecrawl tools:
+  - firecrawl_scrape       — scrape a single URL and return its content as clean markdown
+  - firecrawl_search       — search the web and return relevant results with content
+  - firecrawl_crawl        — crawl an entire website starting from a root URL
+  - firecrawl_map          — map all URLs found on a website
+  - firecrawl_extract      — extract structured data from a URL using a schema or prompt
+
+  ===== STRICT RULES =====
+  1. ONLY use tools to fetch data. Never fabricate web content or URLs.
+  2. When scraping, always return the URL you scraped alongside the content.
+  3. If a URL is unreachable or returns an error, say so clearly.
+  4. For search queries, summarise the top results clearly.
+  5. OUT-OF-SCOPE REFUSAL: If the request is not related to web research,
+     web scraping, URL content, or structured data extraction from the web,
+     refuse and list what you can do.
+
+  ===== RESPONSE FORMAT =====
+  - For scraped content: present as clean markdown with the source URL at the top.
+  - For search results: numbered list with title, URL, and a 1-2 line summary per result.
+  - For structured extraction: present as a formatted table or JSON block.
+  - Always cite the source URL(s) for any data you return.
+  - When called by an orchestrator, answer only what was asked.
+    Never mention other agents, transfers, or routing.
+
+
+# -----------------------------------------------------------------------------
+# MODEL
+# -----------------------------------------------------------------------------
+model:
+  base_model_id: "gemini-2.5-flash"
+  base_model_source: "google_ai_studio"
+  inference:
+    temperature: 0.1
+    max_output_tokens: 8192
+    top_p: 0.9
+
+
+# -----------------------------------------------------------------------------
+# CAPABILITIES
+# Transport: stdio — Firecrawl MCP runs as a local process via npx.
+# Requires: npx installed (Node.js) and FIRECRAWL_API_KEY env var set.
+# Get your API key at: https://firecrawl.dev
+# -----------------------------------------------------------------------------
+capabilities:
+  modalities:
+    input: ["text"]
+    output: ["text"]
+
+  tools:
+    - tool_id: "firecrawl_mcp"
+      display_name: "Firecrawl MCP Server"
+      description: "Web scraping, crawling, search, and structured data extraction via Firecrawl."
+      type: "mcp_server"
+      transport: "stdio"
+      command: "npx"
+      args: ["-y", "firecrawl-mcp"]
+      env:
+        FIRECRAWL_API_KEY: "$FIRECRAWL_API_KEY"
+      on_unavailable: "warn"
+      allowed: true
+
+
+# -----------------------------------------------------------------------------
+# POLICY
+# -----------------------------------------------------------------------------
+policy:
+  confidence_threshold: 0.7
+
+  allowed_problem_types:
+    - "web_search"
+    - "url_scraping"
+    - "data_extraction"
+    - "website_crawl"
+
+  denied_problem_types:
+    - "code_execution"
+    - "image_generation"
+
+  rate_limits:
+    requests_per_minute: 20
+    max_concurrent_sessions: 3
+
+
+# -----------------------------------------------------------------------------
+# DEPLOYMENT
+# -----------------------------------------------------------------------------
+deployment:
+  targets:
+    - environment: "local"
+      runtime: "adk_web"
+
+  lifecycle:
+    max_turns: 20
+    session_timeout_seconds: 300
+    graceful_shutdown_seconds: 30

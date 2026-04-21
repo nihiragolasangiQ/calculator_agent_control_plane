@@ -1,0 +1,198 @@
+# =============================================================================
+# AGENT_TEMPLATE.yaml — Template for adding a new agent to the Control Plane
+#
+# HOW TO USE:
+#   1. Copy this file: cp AGENT_TEMPLATE.yaml my_agent_manifest.yaml
+#   2. Fill in every field marked with  ← REQUIRED
+#   3. Remove sections you don't need (callbacks, observability, etc.)
+#   4. Drop the file in this folder and restart the orchestrator
+#      ORCHESTRATOR_MODE=true adk web .
+#
+# That's it. No other file needs to change.
+#
+# TOOL TYPE QUICK REFERENCE:
+#   type: mcp_server  + transport: stdio  → local process launched via npx/uvx/python
+#   type: mcp_server  + transport: http   → remote HTTP MCP endpoint
+#   type: function                         → local Python function (add to TOOL_REGISTRY)
+#
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# IDENTITY
+# The 'description' field is the most important one here.
+# The orchestrator LLM reads it to decide when to route requests to this agent.
+# Write it as a clear statement of what domain/queries this agent handles.
+# -----------------------------------------------------------------------------
+identity:
+  agent_id: "my_agent_001"           # ← REQUIRED — unique string, no spaces
+  name: "my_agent"                   # ← REQUIRED — used internally by ADK, no spaces
+  display_name: "My Agent"           # ← REQUIRED — shown in ADK web UI
+  description: >                     # ← REQUIRED — drives orchestrator routing
+    Handles [describe what domain or queries this agent covers].
+    Use for [specific request types this agent should receive].
+  owner:
+    team: "your-team"
+    email: "your-team@company.com"
+  version: "1.0.0"
+  status: "active"                   # active | deprecated | experimental
+
+
+# -----------------------------------------------------------------------------
+# INSTRUCTION
+# This is the full system prompt sent to Gemini for this agent.
+# Be explicit about: what the agent does, what tools it has, what it refuses.
+# -----------------------------------------------------------------------------
+instruction: |                       # ← REQUIRED
+
+  You are the [Agent Display Name].
+  Your job is to [describe the agent's purpose in one sentence].
+
+  ===== TOOLS AVAILABLE =====
+  [List each tool and what it does — helps the LLM pick the right one]
+  - tool_one   — does X
+  - tool_two   — does Y
+
+  ===== STRICT RULES =====
+  1. ONLY use data returned by your tools. Never fabricate.
+  2. OUT-OF-SCOPE REFUSAL: If a request is not related to [your domain],
+     refuse clearly and list what you can help with.
+  3. [Add any domain-specific rules here]
+
+  ===== RESPONSE FORMAT =====
+  - [Describe how responses should be structured]
+  - When called by an orchestrator, answer only what was asked.
+    Never mention other agents, transfers, or routing.
+
+
+# -----------------------------------------------------------------------------
+# MODEL
+# -----------------------------------------------------------------------------
+model:
+  base_model_id: "gemini-2.5-flash"  # ← REQUIRED
+  base_model_source: "google_ai_studio"
+  inference:
+    temperature: 0.1                 # 0.0 = deterministic, 1.0 = creative
+    max_output_tokens: 4096
+    top_p: 0.9
+
+
+# -----------------------------------------------------------------------------
+# CAPABILITIES — TOOLS
+# Pick ONE of the three blocks below per tool and delete the others.
+# -----------------------------------------------------------------------------
+capabilities:
+  modalities:
+    input: ["text"]
+    output: ["text"]
+
+  tools:
+
+    # ── OPTION 1: MCP Server (stdio) ─────────────────────────────────────────
+    # Use when the MCP server runs as a local process (npx, uvx, python, etc.)
+    # Requires: Node.js for npx, or Python/uv for uvx/python-based servers
+    - tool_id: "my_stdio_tool"              # ← REQUIRED
+      display_name: "My Stdio Tool"
+      description: "What this tool does."
+      type: "mcp_server"
+      transport: "stdio"
+      command: "npx"                        # ← REQUIRED — e.g. npx / uvx / python
+      args: ["-y", "my-mcp-package"]        # ← REQUIRED — args passed to command
+      env:
+        MY_API_KEY: "$MY_API_KEY"           # env vars expanded from .env at startup
+      on_unavailable: "warn"               # warn = skip gracefully | fail = crash
+      allowed: true
+
+    # ── OPTION 2: MCP Server (HTTP) ──────────────────────────────────────────
+    # Use when the MCP server is a remote HTTP endpoint
+    - tool_id: "my_http_tool"              # ← REQUIRED
+      display_name: "My HTTP Tool"
+      description: "What this tool does."
+      type: "mcp_server"
+      transport: "http"
+      url: "http://localhost:9000/mcp"     # ← REQUIRED
+      allowed_tool_ids: []                 # whitelist specific tools, or remove for all
+      auth:
+        type: "bearer"                     # none | api_key | bearer
+        secret_ref: "MY_API_KEY"           # name of env var holding the credential
+      on_unavailable: "warn"
+      fallback_tool_id: "my_local_fn"      # optional — use if server is unreachable
+      allowed: true
+
+    # ── OPTION 3: Local Python Function ──────────────────────────────────────
+    # Use when the tool is a Python function in this repo.
+    # IMPORTANT: also add the function to TOOL_REGISTRY in agent_from_manifest.py
+    - tool_id: "my_local_fn"              # ← REQUIRED — must match TOOL_REGISTRY key
+      display_name: "My Local Function"
+      description: "What this tool does."
+      type: "function"
+      allowed: true
+
+
+  # ── CALLBACKS (optional) ───────────────────────────────────────────────────
+  # Remove this section if you don't need PII redaction or custom callbacks.
+  # Format: "module.path:factory_function" — resolved dynamically at startup.
+  callbacks:
+    after_model_callback: "orchestrator.incident_agent.pii_redactor:make_pii_redaction_callback"
+    after_tool_callback: "orchestrator.incident_agent.pii_redactor:make_pii_tool_callback"
+
+
+# -----------------------------------------------------------------------------
+# POLICY
+# -----------------------------------------------------------------------------
+policy:
+  confidence_threshold: 0.7
+
+  allowed_problem_types:             # requests this agent accepts
+    - "my_domain_query_type"
+
+  denied_problem_types:              # requests blocked before Gemini sees them
+    - "code_execution"
+    - "image_generation"
+    - "creative_writing"
+
+  escalation:
+    enabled: false
+
+  rate_limits:
+    requests_per_minute: 30
+    max_concurrent_sessions: 5
+
+
+# -----------------------------------------------------------------------------
+# OBSERVABILITY (optional — remove if not needed)
+# -----------------------------------------------------------------------------
+observability:
+  logging:
+    enabled: true
+    log_level: "INFO"
+    log_tool_calls: true
+    redact_pii: true
+
+  metrics:
+    enabled: true
+    track:
+      - name: "tool_call_count"
+        description: "How many times each tool was called"
+      - name: "response_latency_ms"
+        description: "End to end response time in milliseconds"
+
+  alerts:
+    - name: "high_error_rate"
+      metric: "tool_error_rate"
+      threshold: 0.2
+      message: "Too many tool errors — check credentials and connectivity"
+
+
+# -----------------------------------------------------------------------------
+# DEPLOYMENT
+# -----------------------------------------------------------------------------
+deployment:
+  targets:
+    - environment: "local"
+      runtime: "adk_web"
+
+  lifecycle:
+    max_turns: 20
+    session_timeout_seconds: 300
+    graceful_shutdown_seconds: 30

@@ -1,8 +1,7 @@
 # =============================================================================
 # orchestrator_manifest.yaml — Orchestrator Agent
-# Routes user requests to specialist agents based on skills.
-# Swap in via: MANIFEST_PATH=orchestrator/manifest/orchestrator_manifest.yaml
-#              ORCHESTRATOR_MODE=true
+# Routes user requests to the IGA Incident Analysis Agent.
+# Swap in via: ORCHESTRATOR_MODE=true
 # Version schema: v1.0
 # =============================================================================
 
@@ -14,9 +13,8 @@ identity:
   name: "orchestrator"
   display_name: "Orchestrator Agent"
   description: >
-    Routes user requests to the right specialist agents.
-    Handles multi-domain questions by delegating to multiple agents
-    in parallel and aggregating their responses into one final answer.
+    Routes user requests to the IGA Incident Analysis specialist agent.
+    Delegates all incident-related queries and aggregates responses.
   owner:
     team: "quantum-team"
     email: "quantum@company.com"
@@ -28,34 +26,29 @@ identity:
 # INSTRUCTION
 # -----------------------------------------------------------------------------
 instruction: |
-  You are a routing orchestrator. You have NO knowledge of your own.
-  You CANNOT answer any question directly. You MUST always call a tool.
+  You are an intelligent assistant with access to a set of specialist agents.
+  You route user requests to the right agent — but you can also respond directly
+  to greetings, meta questions, and capability questions without calling any tool.
 
-  You have exactly two tools available:
-  - calculator_agent: handles ANY math, arithmetic, numbers, or calculations
-  - palindrome_agent: handles ANY text, palindromes, string analysis, or scoring
+  {agent_routing_block}
 
-  DECOMPOSITION RULES:
-  - Analyse the request and identify which parts belong to which domain
-  - For math parts: call calculator_agent with ONLY the math portion of the question
-  - For palindrome/text parts: call palindrome_agent with ONLY the text portion of the question
-  - If the request involves BOTH domains, call BOTH tools — each with only its relevant sub-question
-  - NEVER send the full mixed question to a single agent — split it first
-  - NEVER attempt to answer any question yourself — you have no ability to do so
-  - NEVER escalate — escalation is the tools' responsibility, not yours
-  - If NO tool can handle it, only then say you cannot help
+  WHEN TO RESPOND DIRECTLY (no tool call needed):
+  - Greetings ("hi", "hello", "hey") → respond warmly and summarise what you can help with
+  - Capability questions ("what can you do?", "how can you help?") → list what each agent handles
+  - Unclear or very short messages → ask the user to clarify what they need
 
-  EXAMPLE DECOMPOSITION:
-  User: "What is 7 x 8? Is the result a palindrome?"
-  → Call calculator_agent with: "What is 7 x 8?"
-  → Call palindrome_agent with: "Is 56 a palindrome?"
-  → Combine and present both answers together
+  WHEN TO ROUTE (call the appropriate agent tool):
+  - Any specific domain request → route to the most relevant agent
+  - If no agent is relevant, politely tell the user what you can and cannot help with
 
-  RESPONSE FORMAT:
-  - Never mention tool names, agent names, transfers, handoffs, or routing in your response
-  - Never say "I will transfer", "routing to", "asking the agent", or similar
-  - Present the final combined answer as if it came from you directly
-  - The user should never know how many agents were involved
+  STRICT RULES:
+  - NEVER fabricate domain data (incidents, web content) yourself — always route those
+  - When routing, never mention agent names, tool names, transfers, or handoffs
+  - Present routed responses as if they came from you directly
+
+  GREETING RESPONSE FORMAT:
+  When greeting, introduce yourself briefly and list capabilities in plain language.
+  Example: "Hi! I can help you with [X] and [Y]. What would you like to do?"
 
 
 # -----------------------------------------------------------------------------
@@ -66,45 +59,22 @@ model:
   base_model_source: "google_ai_studio"
   inference:
     temperature: 0.1
-    max_output_tokens: 2048
+    max_output_tokens: 4096
     top_p: 0.9
 
 
 # -----------------------------------------------------------------------------
 # CAPABILITIES
-# Sub-agents declared here — each specialist is a fully independent agent.
-# The orchestrator delegates to them; they never share tools.
+# Sub-agents are NOT declared here. They are auto-discovered at startup by
+# orchestrator.py — every *_manifest.yaml in this folder (except this file)
+# is loaded as a specialist sub-agent automatically.
 # -----------------------------------------------------------------------------
 capabilities:
   modalities:
     input: ["text"]
     output: ["text"]
 
-  tools:
-    - tool_id: "calculator_agent"
-      type: "sub_agent"
-      display_name: "Calculator Agent"
-      description: "Handles arithmetic, algebra, and word problems."                       #change path when using MCP server here!
-      manifest_path: "orchestrator/manifest/calculator_agent_manifest.yaml"                #orchestrator/manifest/calculator_mcp_manifest.yaml
-      skills:
-        - "arithmetic"
-        - "algebra"
-        - "word_problems"
-      version: "1.0.0"
-      allowed: true
-
-    - tool_id: "palindrome_agent"
-      type: "sub_agent"
-      display_name: "Palindrome Agent"
-      description: "Handles palindrome checks, text analysis, and string transformations."  #change path when using MCP server here!
-      manifest_path: "orchestrator/manifest/palindrome_agent_manifest.yaml"                 #orchestrator/manifest/palindrome_mcp_manifest.yaml
-      skills:
-        - "palindrome_check"
-        - "text_analysis"
-        - "text_transformation"
-        - "text_scoring"
-      version: "1.0.0"
-      allowed: true
+  tools: []
 
 
 # -----------------------------------------------------------------------------
@@ -112,9 +82,7 @@ capabilities:
 # -----------------------------------------------------------------------------
 policy:
   confidence_threshold: 0.7
-
   denied_problem_types: []
-
   rate_limits:
     requests_per_minute: 30
     max_concurrent_sessions: 5
